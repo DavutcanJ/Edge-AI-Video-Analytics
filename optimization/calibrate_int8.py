@@ -223,7 +223,7 @@ def main():
     )
     
     print("\n[INFO] Calibration setup complete")
-    print("[INFO] Run build_trt_engine.py with --precision int8 and --calibration-cache {} to build INT8 engine".format(args.output))
+    print("[INFO] Run build_trt_engine.py with --precision fp16 and --calibration-cache {} to build INT8 engine".format(args.output))
 
 
 if __name__ == "__main__":

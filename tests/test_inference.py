@@ -329,7 +329,7 @@ class TestDriftDetection:
         iou_matrix = VideoEngine._compute_iou_matrix(boxes1, boxes2)
         
         assert iou_matrix.shape == (2, 2)
-        import numpy as np
+        
         assert np.isclose(iou_matrix[0, 0], 1.0, atol=1e-6)  # Perfect match
         assert iou_matrix[1, 1] < 0.1  # Little overlap
 

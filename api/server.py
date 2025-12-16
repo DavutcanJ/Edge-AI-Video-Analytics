@@ -39,6 +39,26 @@ from monitoring.fps_meter import FPSMeter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# COCO class names (80 classes)
+COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane',
+    'bus', 'train', 'truck', 'boat', 'traffic light',
+    'fire hydrant', 'stop sign', 'parking meter', 'bench', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant',
+    'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis',
+    'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass',
+    'cup', 'fork', 'knife', 'spoon', 'bowl',
+    'banana', 'apple', 'sandwich', 'orange', 'broccoli',
+    'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+    'chair', 'couch', 'potted plant', 'bed', 'dining table',
+    'toilet', 'tv', 'laptop', 'mouse', 'remote',
+    'keyboard', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors',
+    'teddy bear', 'hair drier', 'toothbrush'
+]
+
 # Initialize FastAPI app
 
 @asynccontextmanager
@@ -62,6 +82,7 @@ async def lifespan(app: FastAPI):
                 img_size=640,
                 conf_threshold=0.25,
                 iou_threshold=0.45,
+                class_names=COCO_CLASSES,
                 warmup_iterations=10
             )
             logger.info("Detector initialized successfully")
@@ -117,6 +138,7 @@ async def health_check():
         gpu_available=gpu_available
     )
 
+total_requests = 0
 
 @app.get("/metrics", response_model=MetricsResponse)
 async def get_metrics():

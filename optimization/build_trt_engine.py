@@ -65,6 +65,8 @@ class TRTEngineBuilder:
         # Set output path
         if output_path is None:
             suffix = f"_{precision}.engine"
+            if not suffix.startswith('.'):
+                suffix = '.' + suffix.lstrip('_')
             output_path = self.onnx_path.with_suffix(suffix)
         else:
             output_path = Path(output_path)
@@ -176,7 +178,7 @@ class TRTEngineBuilder:
         """Print information about the built engine."""
         runtime = trt.Runtime(self.TRT_LOGGER)
         engine = runtime.deserialize_cuda_engine(serialized_engine)
-        
+
         print(f"\n{'='*60}")
         print("ENGINE INFORMATION")
         print(f"{'='*60}")
@@ -185,16 +187,25 @@ class TRTEngineBuilder:
             binding_count = len(engine)
         print(f"Number of bindings: {binding_count}")
         for i in range(binding_count):
-            name = engine.get_binding_name(i)
-            dtype = engine.get_binding_dtype(i)
-            shape = engine.get_binding_shape(i)
-            is_input = engine.binding_is_input(i)
+            # Try to get tensor name for this binding
+            try:
+                name = engine.get_tensor_name(i)
+            except AttributeError:
+                # Fallback: try engine[i] if get_tensor_name is not available
+                try:
+                    name = engine[i]
+                except Exception:
+                    name = str(i)
+            try:
+                dtype = engine.get_tensor_dtype(name)
+                shape = engine.get_tensor_shape(name)
+            except Exception as e:
+                print(f"[ERROR] Could not get info for binding {i}: {e}")
+                dtype = shape = None
             print(f"\nBinding {i}:")
             print(f"  Name:   {name}")
-            print(f"  Type:   {'INPUT' if is_input else 'OUTPUT'}")
             print(f"  Shape:  {shape}")
             print(f"  Dtype:  {dtype}")
-        
         print(f"\n{'='*60}\n")
 
 

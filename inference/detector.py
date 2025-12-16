@@ -32,6 +32,7 @@ class Detector:
     """
     
     def __init__(
+                
         self,
         model_path: str,
         backend: str = "pytorch",
@@ -55,6 +56,8 @@ class Detector:
             class_names: List of class names
             warmup_iterations: Number of warmup iterations
         """
+   
+                
         self.model_path = Path(model_path)
         self.backend = backend.lower()
         self.device = device
@@ -77,6 +80,20 @@ class Detector:
         self._warmup()
         
         print(f"[INFO] Detector ready: {self.backend.upper()}")
+
+             # CUDA device check (if backend is tensorrt or pytorch and device contains 'cuda')
+        if (self.backend in ["tensorrt", "pytorch"]) and ("cuda" in str(self.device)):
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+                if cuda_available:
+                    device_count = torch.cuda.device_count()
+                    device_name = torch.cuda.get_device_name(0)
+                    print(f"[INFO] CUDA detected: {device_name} (total devices: {device_count})")
+                else:
+                    print("[WARNING] CUDA device not available! Inference will run on CPU.")
+            except ImportError:
+                print("[WARNING] torch not installed, cannot check CUDA device.")
     
     def _load_model(self):
         """Load model based on backend."""
@@ -110,37 +127,51 @@ class Detector:
         print(f"[OK] ONNX model loaded with providers: {self.session.get_providers()}")
     
     def _load_tensorrt(self):
-        """Load TensorRT engine."""
+        """Load TensorRT engine (TensorRT 10+ IO Tensor API)."""
         self.TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-        
-        with open(self.model_path, 'rb') as f:
+
+        with open(self.model_path, "rb") as f:
             self.runtime = trt.Runtime(self.TRT_LOGGER)
             self.engine = self.runtime.deserialize_cuda_engine(f.read())
-        
+
+        if self.engine is None:
+            raise RuntimeError("Failed to deserialize TensorRT engine")
+
         self.context = self.engine.create_execution_context()
-        
-        # Get input/output bindings
+
+        # IO tensor indexleri (çoğu engine: 0=input, 1=output)
         self.input_idx = 0
         self.output_idx = 1
-        
-        # Allocate buffers
+
+        in_name = self.engine.get_tensor_name(self.input_idx)
+        out_name = self.engine.get_tensor_name(self.output_idx)
+
+        # Input shape
         self.input_shape = (1, 3, self.img_size, self.img_size)
-        self.output_shape = self.engine.get_binding_shape(self.output_idx)
-        
-        input_size = np.prod(self.input_shape) * np.dtype(np.float32).itemsize
-        output_size = np.prod(self.output_shape) * np.dtype(np.float32).itemsize
-        
+
+        # Dinamik shape varsa önce input shape set et (çok kritik)
+        self.context.set_input_shape(in_name, self.input_shape)
+
+        # Output shape'i context'ten al (engine.get_tensor_shape da olur ama context daha güvenli)
+        self.output_shape = tuple(self.context.get_tensor_shape(out_name))
+
+        # Allocate buffers
+        input_size = int(np.prod(self.input_shape)) * np.dtype(np.float32).itemsize
+        output_size = int(np.prod(self.output_shape)) * np.dtype(np.float32).itemsize
+
         self.d_input = cuda.mem_alloc(input_size)
         self.d_output = cuda.mem_alloc(output_size)
-        
-        self.bindings = [int(self.d_input), int(self.d_output)]
+
+        # TRT10: binding list yerine tensor address set edilir
+        self.context.set_tensor_address(in_name, int(self.d_input))
+        self.context.set_tensor_address(out_name, int(self.d_output))
+
         self.stream = cuda.Stream()
-        
         self.h_output = np.empty(self.output_shape, dtype=np.float32)
-        
-        print(f"[OK] TensorRT engine loaded")
-        print(f"  Input shape:  {self.input_shape}")
-        print(f"  Output shape: {self.output_shape}")
+
+        print("[OK] TensorRT engine loaded")
+        print(f"  Input tensor:  {in_name}  shape={self.input_shape}")
+        print(f"  Output tensor: {out_name} shape={self.output_shape}")
     
     def _warmup(self):
         """Warmup the model."""
@@ -200,11 +231,16 @@ class Detector:
     
     def _infer_tensorrt(self, preprocessed: np.ndarray) -> np.ndarray:
         """TensorRT inference."""
+        preprocessed = np.ascontiguousarray(preprocessed)
         # Copy input to device
         cuda.memcpy_htod_async(self.d_input, preprocessed, self.stream)
         
         # Run inference
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        # Use execute_async_v3 if available (TensorRT >= 10), else fallback to v2
+        if hasattr(self.context, 'execute_async_v3'):
+            self.context.execute_async_v3(stream_handle=self.stream.handle)
+        else:
+            self.context.execute_async_v2(stream_handle=self.stream.handle)
         
         # Copy output to host
         cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.stream)
@@ -264,10 +300,19 @@ class Detector:
         else:
             boxes = output
         
+        # DEBUG: Print output info
+        # print(f"[DEBUG] Output shape: {output.shape}, boxes shape: {boxes.shape}")        
         # Apply confidence threshold
         confidences = boxes[:, 4]
+        # Normalize confidences to [0, 1] if they're out of range
+        max_conf = np.max(confidences) if len(confidences) > 0 else 1.0
+        if max_conf > 1.0:
+            confidences = confidences / max_conf
+        confidences = np.clip(confidences, 0.0, 1.0)
+        
         mask = confidences > self.conf_threshold
         boxes = boxes[mask]
+        confidences = confidences[mask]
         
         if len(boxes) == 0:
             self.postprocess_times.append((time.perf_counter() - t0) * 1000)
@@ -280,6 +325,12 @@ class Detector:
         # Get class IDs and confidences
         class_ids = np.argmax(class_scores, axis=1)
         class_confidences = np.max(class_scores, axis=1)
+        # Normalize confidences to [0, 1]
+        class_confidences = np.clip(class_confidences, 0.0, 1.0)
+        
+        # Use the normalized confidences from earlier if class_confidences are invalid
+        if np.any(class_confidences > 1.0):
+            class_confidences = confidences
         
         # Convert from center format to corner format
         x_center, y_center = box_coords[:, 0], box_coords[:, 1]
@@ -290,6 +341,12 @@ class Detector:
         x2 = x_center + width / 2
         y2 = y_center + height / 2
         
+        # Clip to image bounds
+        x1 = np.maximum(0, x1)
+        y1 = np.maximum(0, y1)
+        x2 = np.minimum(self.img_size, x2)
+        y2 = np.minimum(self.img_size, y2)
+        
         # Scale to original image size
         scale_x = orig_shape[1] / self.img_size
         scale_y = orig_shape[0] / self.img_size
@@ -299,6 +356,10 @@ class Detector:
         y1 *= scale_y
         y2 *= scale_y
         
+        # DEBUG: Print first detection before NMS
+        # if len(class_ids) > 0:
+        #     print(f"[DEBUG] First detection: class_id={class_ids[0]}, confidence={class_confidences[0]:.4f}, bbox=({x1[0]:.1f}, {y1[0]:.1f}, {x2[0]:.1f}, {y2[0]:.1f})")
+        
         # Apply NMS
         boxes_for_nms = np.stack([x1, y1, x2, y2], axis=1)
         keep_indices = self.nms(boxes_for_nms, class_confidences, self.iou_threshold)
@@ -306,7 +367,12 @@ class Detector:
         # Create Detection objects
         for idx in keep_indices:
             class_id = int(class_ids[idx])
-            class_name = self.class_names[class_id] if class_id < len(self.class_names) else str(class_id)
+            # Validate class_id
+            if class_id < 0 or class_id >= len(self.class_names):
+                print(f"[WARNING] Invalid class_id {class_id}, using 'unknown'")
+                class_name = f"unknown_{class_id}"
+            else:
+                class_name = self.class_names[class_id]
             
             detection = Detection(
                 bbox=(float(x1[idx]), float(y1[idx]), float(x2[idx]), float(y2[idx])),
