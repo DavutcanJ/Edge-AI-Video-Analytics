@@ -74,7 +74,12 @@ def run_training():
         print("[INFO] training/train.py bulunamadı.")
         return
     
-    print("\n[3a] Model eğitimi başlatılıyor...")
+    print("\n" + "="*70)
+    print("📚 Model Eğitimi Başlatılıyor")
+    print("="*70)
+    print("\n💡 İpucu: Eğitim sırasında ilerlemeyi izlemek için:")
+    print("   python training/monitor_training.py --total-epochs 50")
+    print("   komutu başka bir terminal'de çalıştırabilirsiniz.\n")
     print("(Eğitim adımını atlamak için Ctrl+C ile çıkabilirsiniz)\n")
     
     try:
@@ -82,12 +87,13 @@ def run_training():
             sys.executable, train_script,
             "--config", "training/dataset.yaml",
             "--model", "yolov8n.pt",
-            "--epochs", "100",
+            "--epochs", "50",
             "--batch", "8",
-            "--imgsz", "640",
-            "--device", "0"
+            "--imgsz", "480",
+            "--device", "0",
+            "--workers", "4"
         ], check=True)
-        print("[OK] Eğitim tamamlandı.")
+        print("\n✅ [OK] Eğitim tamamlandı.")
     except KeyboardInterrupt:
         print("\n[INFO] Eğitim adımı atlandı (Ctrl+C).")
     except Exception as e:

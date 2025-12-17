@@ -16,6 +16,8 @@ import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 import wandb
 from datetime import datetime
+from tqdm import tqdm
+import json
 
 
 class AdvancedTrainer:
@@ -156,13 +158,13 @@ class AdvancedTrainer:
     def train(
         self,
         model_name: str = "yolov8n.pt",
-        epochs: int = 100,
-        imgsz: int = 640,
-        batch: int = 16,
+        epochs: int = 50,
+        imgsz: int = 480,
+        batch: int = 8,
         device: str = "0",
-        workers: int = 8,
-        patience: int = 50,
-        save_period: int = 10,
+        workers: int = 4,
+        patience: int = 20,
+        save_period: int = 5,
         **kwargs
     ):
         """
@@ -179,10 +181,13 @@ class AdvancedTrainer:
             save_period: Save checkpoint every N epochs
             **kwargs: Additional training arguments
         """
+        print(f"\n{'='*70}")
         print(f"[INFO] Initializing model: {model_name}")
+        print(f"{'='*70}")
+        
         model = YOLO(model_name)
         
-        # Training arguments
+        # Training arguments - optimized for RTX 3050 Ti (4GB VRAM)
         train_args = {
             'data': self.config_path,
             'epochs': epochs,
@@ -199,54 +204,67 @@ class AdvancedTrainer:
             'lrf': 0.01,   # Final learning rate factor (lr0 * lrf)
             'momentum': 0.937,
             'weight_decay': 0.0005,
-            'warmup_epochs': 3.0,
+            'warmup_epochs': 2.0,
             'warmup_momentum': 0.8,
             'warmup_bias_lr': 0.1,
             
-            # Augmentation settings (YOLO native)
-            'mosaic': 1.0,      # Mosaic augmentation
-            'mixup': 0.1,       # MixUp augmentation
-            'copy_paste': 0.1,  # Copy-paste augmentation
-            'degrees': 15.0,    # Rotation
+            # Augmentation settings (YOLO native) - reduced for memory
+            'mosaic': 0.5,      # Mosaic augmentation (reduced)
+            'mixup': 0.0,       # MixUp augmentation (disabled for memory)
+            'copy_paste': 0.0,  # Copy-paste augmentation (disabled for memory)
+            'degrees': 10.0,    # Rotation
             'translate': 0.1,   # Translation
-            'scale': 0.5,       # Scale
+            'scale': 0.3,       # Scale (reduced)
             'shear': 0.0,       # Shear
             'perspective': 0.0, # Perspective
-            'flipud': 0.1,      # Vertical flip
+            'flipud': 0.0,      # Vertical flip (disabled)
             'fliplr': 0.5,      # Horizontal flip
             'hsv_h': 0.015,     # HSV-Hue augmentation
-            'hsv_s': 0.7,       # HSV-Saturation augmentation
-            'hsv_v': 0.4,       # HSV-Value augmentation
+            'hsv_s': 0.5,       # HSV-Saturation augmentation (reduced)
+            'hsv_v': 0.3,       # HSV-Value augmentation (reduced)
             
-            # Advanced training settings
-            'amp': True,        # Automatic Mixed Precision
+            # Advanced training settings - memory optimized
+            'amp': True,        # Automatic Mixed Precision (IMPORTANT for memory)
             'cos_lr': True,     # Cosine learning rate scheduler
-            'close_mosaic': 10, # Disable mosaic in last N epochs
+            'close_mosaic': 5,  # Disable mosaic in last N epochs
+            'cache': False,     # Don't cache images in RAM
+            'rect': True,       # Rectangular training (faster, less memory)
             
             # Logging
             'project': str(self.logs_dir),
             'name': f'exp_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
             'exist_ok': True,
             'pretrained': True,
-            'verbose': True,
+            'verbose': True,    # Show progress
             'plots': True,
             'save': True,
             'save_json': True,
             'val': True,
-            
-            # Multi-scale training
-            'rect': False,  # Rectangular training (set True for faster, False for multi-scale)
         }
         
         # Update with any additional kwargs
         train_args.update(kwargs)
         
-        print(f"[INFO] Starting training with config:")
-        for key, value in train_args.items():
-            print(f"  {key}: {value}")
+        print(f"\n📊 Training Configuration:")
+        print(f"  Model: {model_name}")
+        print(f"  Epochs: {epochs}")
+        print(f"  Batch Size: {batch}")
+        print(f"  Image Size: {imgsz}")
+        print(f"  Device: {device}")
+        print(f"  Workers: {workers}")
+        print(f"  Learning Rate: {train_args['lr0']}")
+        print(f"  Patience (Early Stopping): {patience}")
+        print(f"\n{'='*70}\n")
         
         # Train the model
-        results = model.train(**train_args)
+        try:
+            results = model.train(**train_args)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Training interrupted by user!")
+            return None, None
+        except Exception as e:
+            print(f"\n❌ Training error: {e}")
+            return None, None
         
         # Save best model to models directory
         models_dir = self.project_root / "models"
@@ -257,20 +275,34 @@ class AdvancedTrainer:
             import shutil
             dest_path = models_dir / "latest.pt"
             shutil.copy(str(best_model_path), str(dest_path))
-            print(f"[INFO] Best model saved to: {dest_path}")
+            print(f"✅ Best model saved to: {dest_path}")
         
         # Validate and print metrics
-        print("\n[INFO] Validating model...")
+        print("\n" + "="*70)
+        print("📈 Validating model...")
+        print("="*70)
         metrics = model.val()
         
-        print(f"\n{'='*60}")
-        print("TRAINING COMPLETE - FINAL METRICS")
-        print(f"{'='*60}")
-        print(f"mAP@0.5:     {metrics.box.map50:.4f}")
-        print(f"mAP@0.5:0.95: {metrics.box.map:.4f}")
-        print(f"Precision:   {metrics.box.mp:.4f}")
-        print(f"Recall:      {metrics.box.mr:.4f}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print("✅ TRAINING COMPLETE - FINAL METRICS")
+        print(f"{'='*70}")
+        print(f"  mAP@0.5:      {metrics.box.map50:.4f}")
+        print(f"  mAP@0.5:0.95: {metrics.box.map:.4f}")
+        print(f"  Precision:    {metrics.box.mp:.4f}")
+        print(f"  Recall:       {metrics.box.mr:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Save metrics to JSON
+        metrics_path = models_dir / "latest_metrics.json"
+        metrics_dict = {
+            'map50': float(metrics.box.map50),
+            'map': float(metrics.box.map),
+            'precision': float(metrics.box.mp),
+            'recall': float(metrics.box.mr),
+            'timestamp': datetime.now().isoformat()
+        }
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics_dict, f, indent=2)
         
         # Log to W&B
         if self.use_wandb:
