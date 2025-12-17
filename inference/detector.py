@@ -295,57 +295,101 @@ class Detector:
         
         # Handle different output formats
         if len(output.shape) == 3:
-            # Shape: [batch, num_boxes, attributes]
-            boxes = output[0]  # Remove batch dimension
+            # Shape could be [batch, num_boxes, attributes] OR [batch, attributes, num_predictions]
+            # YOLO v8 format: [batch, 4+num_classes, num_predictions]
+            # e.g., (1, 84, 8400) where 84 = 4 (bbox) + 80 (classes)
+            
+            # Check if it's YOLO format (channels-first)
+            if output.shape[1] <= 100:  # Likely [batch, attrs, preds] format
+                # Transpose to [batch, num_predictions, attrs]
+                output = output.transpose(0, 2, 1)  # (1, 8400, 84)
+            
+            boxes = output[0]  # Remove batch dimension -> (8400, 84)
         else:
             boxes = output
         
         # DEBUG: Print output info
-        # print(f"[DEBUG] Output shape: {output.shape}, boxes shape: {boxes.shape}")        
-        # Apply confidence threshold
-        confidences = boxes[:, 4]
-        # Normalize confidences to [0, 1] if they're out of range
-        max_conf = np.max(confidences) if len(confidences) > 0 else 1.0
-        if max_conf > 1.0:
-            confidences = confidences / max_conf
-        confidences = np.clip(confidences, 0.0, 1.0)
+        print(f"\n[DEBUG] ========== POSTPROCESS START ==========")
+        print(f"[DEBUG] Original output shape: {output.shape}")
+        print(f"[DEBUG] Boxes shape after transpose: {boxes.shape}")
+        print(f"[DEBUG] Original image shape: {orig_shape}, inference size: {self.img_size}x{self.img_size}")
+        if boxes.shape[0] > 0:
+            print(f"[DEBUG] First box raw: {boxes[0]}")
         
-        mask = confidences > self.conf_threshold
-        boxes = boxes[mask]
-        confidences = confidences[mask]
+        # Extract predictions
+        # Format: [x_center, y_center, width, height, conf_score, class_1, class_2, ..., class_80]
+        box_coords = boxes[:, :4]  # [x_center, y_center, width, height]
+        box_conf = boxes[:, 4]      # Objectness confidence
+        class_scores = boxes[:, 5:] # Class probabilities [num_preds, 80]
         
-        if len(boxes) == 0:
+        # DEBUG: Print raw scores BEFORE sigmoid
+        print(f"[DEBUG] RAW box_conf - min={np.min(box_conf):.8f}, max={np.max(box_conf):.8f}, mean={np.mean(box_conf):.8f}")
+        print(f"[DEBUG] RAW first 10 box_conf values: {box_conf[:10]}")
+        print(f"[DEBUG] RAW class_scores - min={np.min(class_scores):.8f}, max={np.max(class_scores):.8f}, mean={np.mean(class_scores):.8f}")
+        
+        # Apply sigmoid if values are too small (raw model output)
+        if np.max(box_conf) < 1.0 and np.max(box_conf) > 1e-5:
+            # Values look like they need sigmoid
+            print(f"[DEBUG] APPLYING SIGMOID (raw values detected)")
+            box_conf_before = box_conf.copy()
+            box_conf = 1.0 / (1.0 + np.exp(-box_conf))
+            class_scores = 1.0 / (1.0 + np.exp(-class_scores))
+            print(f"[DEBUG] After sigmoid - box_conf: min={np.min(box_conf):.8f}, max={np.max(box_conf):.8f}, mean={np.mean(box_conf):.8f}")
+            print(f"[DEBUG] Before sigmoid (first 10): {box_conf_before[:10]}")
+            print(f"[DEBUG] After sigmoid (first 10): {box_conf[:10]}")
+        else:
+            print(f"[DEBUG] SIGMOID NOT APPLIED (max={np.max(box_conf):.8f}, min={np.min(box_conf):.8f})")
+        
+        # Apply confidence threshold on objectness score
+        confidences = box_conf
+        print(f"[DEBUG] Confidence range: min={np.min(confidences):.6f}, max={np.max(confidences):.6f}, mean={np.mean(confidences):.6f}")
+        print(f"[DEBUG] Threshold: {self.conf_threshold}")
+        
+        # Use much lower threshold for debugging (0.001 = 0.1%)
+        DEBUG_THRESHOLD = 0.001
+        mask = confidences > DEBUG_THRESHOLD
+        print(f"[DEBUG] Boxes passing threshold (0.1%): {np.sum(mask)} / {len(confidences)}")
+        
+        boxes_filtered = boxes[mask]
+        box_coords_filtered = box_coords[mask]
+        box_conf_filtered = confidences[mask]
+        class_scores_filtered = class_scores[mask]
+        
+        if len(boxes_filtered) == 0:
+            print(f"[DEBUG] No detections after threshold\n")
             self.postprocess_times.append((time.perf_counter() - t0) * 1000)
             return []
         
-        # Extract box coordinates and class predictions
-        box_coords = boxes[:, :4]  # [x_center, y_center, width, height]
-        class_scores = boxes[:, 5:]  # Class probabilities
+        print(f"[DEBUG] Total detections: {len(boxes_filtered)}")
+        print(f"[DEBUG] Box conf range: min={np.min(box_conf_filtered):.6f}, max={np.max(box_conf_filtered):.6f}")
+        print(f"[DEBUG] Class scores range: min={np.min(class_scores_filtered):.6f}, max={np.max(class_scores_filtered):.6f}")
         
-        # Get class IDs and confidences
-        class_ids = np.argmax(class_scores, axis=1)
-        class_confidences = np.max(class_scores, axis=1)
-        # Normalize confidences to [0, 1]
+        print(f"[DEBUG] Detections after threshold: {len(boxes_filtered)}")
+        
+        # Get class IDs and max class confidence
+        class_ids = np.argmax(class_scores_filtered, axis=1)
+        class_confidences = np.max(class_scores_filtered, axis=1)
+        
+        print(f"[DEBUG] Class scores shape: {class_scores_filtered.shape}")
+        print(f"[DEBUG] First 5 class_ids: {class_ids[:5]}")
+        print(f"[DEBUG] First 5 class_confs: {class_confidences[:5]}")
+        print(f"[DEBUG] First 5 box_confs: {box_conf_filtered[:5]}")
+        
+        # Normalize class confidences to [0, 1]
         class_confidences = np.clip(class_confidences, 0.0, 1.0)
+        box_conf_filtered = np.clip(box_conf_filtered, 0.0, 1.0)
         
-        # Use the normalized confidences from earlier if class_confidences are invalid
-        if np.any(class_confidences > 1.0):
-            class_confidences = confidences
+        # Use max of objectness and class confidence as final score
+        final_confidences = np.maximum(box_conf_filtered, class_confidences)
         
-        # Convert from center format to corner format
-        x_center, y_center = box_coords[:, 0], box_coords[:, 1]
-        width, height = box_coords[:, 2], box_coords[:, 3]
+        print(f"[DEBUG] Final confidences range: min={np.min(final_confidences):.6f}, max={np.max(final_confidences):.6f}")
+        x_center, y_center = box_coords_filtered[:, 0], box_coords_filtered[:, 1]
+        width, height = box_coords_filtered[:, 2], box_coords_filtered[:, 3]
         
         x1 = x_center - width / 2
         y1 = y_center - height / 2
         x2 = x_center + width / 2
         y2 = y_center + height / 2
-        
-        # Clip to image bounds
-        x1 = np.maximum(0, x1)
-        y1 = np.maximum(0, y1)
-        x2 = np.minimum(self.img_size, x2)
-        y2 = np.minimum(self.img_size, y2)
         
         # Scale to original image size
         scale_x = orig_shape[1] / self.img_size
@@ -356,32 +400,40 @@ class Detector:
         y1 *= scale_y
         y2 *= scale_y
         
-        # DEBUG: Print first detection before NMS
-        # if len(class_ids) > 0:
-        #     print(f"[DEBUG] First detection: class_id={class_ids[0]}, confidence={class_confidences[0]:.4f}, bbox=({x1[0]:.1f}, {y1[0]:.1f}, {x2[0]:.1f}, {y2[0]:.1f})")
+        # Clip to original image bounds
+        x1 = np.maximum(0, x1)
+        y1 = np.maximum(0, y1)
+        x2 = np.minimum(orig_shape[1], x2)
+        y2 = np.minimum(orig_shape[0], y2)
+        
+        print(f"[DEBUG] First bbox after scaling: ({x1[0]:.1f}, {y1[0]:.1f}, {x2[0]:.1f}, {y2[0]:.1f})")
         
         # Apply NMS
         boxes_for_nms = np.stack([x1, y1, x2, y2], axis=1)
-        keep_indices = self.nms(boxes_for_nms, class_confidences, self.iou_threshold)
+        keep_indices = self.nms(boxes_for_nms, final_confidences, self.iou_threshold)
+        
+        print(f"[DEBUG] Final detections after NMS: {len(keep_indices)}")
         
         # Create Detection objects
         for idx in keep_indices:
             class_id = int(class_ids[idx])
             # Validate class_id
             if class_id < 0 or class_id >= len(self.class_names):
-                print(f"[WARNING] Invalid class_id {class_id}, using 'unknown'")
+                print(f"[WARNING] Invalid class_id {class_id}, total_classes={len(self.class_names)}")
                 class_name = f"unknown_{class_id}"
             else:
                 class_name = self.class_names[class_id]
             
             detection = Detection(
                 bbox=(float(x1[idx]), float(y1[idx]), float(x2[idx]), float(y2[idx])),
-                confidence=float(class_confidences[idx]),
+                confidence=float(final_confidences[idx]),
                 class_id=class_id,
                 class_name=class_name
             )
             detections.append(detection)
+            print(f"[DEBUG] → {class_name} (id={class_id}), conf={final_confidences[idx]:.4f}, bbox=({x1[idx]:.1f},{y1[idx]:.1f},{x2[idx]:.1f},{y2[idx]:.1f})")
         
+        print(f"[DEBUG] ========== POSTPROCESS END ==========\n")
         self.postprocess_times.append((time.perf_counter() - t0) * 1000)
         
         return detections

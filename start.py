@@ -46,7 +46,7 @@ def check_models():
     
     pt_exists = Path("models/latest.pt").exists()
     onnx_exists = Path("models/latest.onnx").exists()
-    trt_exists = Path("models/model_fp16.engine").exists()
+    trt_exists = Path("models/latest.fp16.engine").exists()
     
     print(f"  PyTorch model (.pt): {'✓' if pt_exists else '✗'}")
     print(f"  ONNX model (.onnx):  {'✓' if onnx_exists else '✗'}")
@@ -82,7 +82,7 @@ def run_training():
             sys.executable, train_script,
             "--config", "training/dataset.yaml",
             "--model", "yolov8n.pt",
-            "--epochs", "1",
+            "--epochs", "100",
             "--batch", "8",
             "--imgsz", "640",
             "--device", "0"

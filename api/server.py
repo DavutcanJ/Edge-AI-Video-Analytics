@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     global detector, metrics_logger, fps_meter
     logger.info("Starting up server...")
     import os
-    model_path = os.getenv("MODEL_PATH", "models/model_fp16.engine")
+    model_path = os.getenv("MODEL_PATH", "models/latest.fp16.engine")
     backend = os.getenv("BACKEND", "tensorrt")
     device = os.getenv("DEVICE", "cuda:0")
     logger.info(f"Loading model: {model_path}")
