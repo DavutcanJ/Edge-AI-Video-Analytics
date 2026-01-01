@@ -5,11 +5,163 @@ Supports multi-backend (PyTorch, ONNX, TensorRT) and real-time video streaming.
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+# Load .env file
+from dotenv import load_dotenv
+load_dotenv(project_root / ".env")
+
+# =============================================================================
+# Sentry Integration
+# =============================================================================
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
+
+# Check if Sentry metrics should be enabled (disabled by default for memory)
+SENTRY_METRICS_ENABLED = os.environ.get("SENTRY_METRICS_ENABLED", "false").lower() == "true"
+
+if SENTRY_METRICS_ENABLED:
+    try:
+        # Available in sentry-sdk >= 2.x
+        from sentry_sdk import metrics as sentry_metrics
+    except Exception:  # pragma: no cover
+        SENTRY_METRICS_ENABLED = False
+        sentry_metrics = None
+else:
+    sentry_metrics = None
+
+# No-op metrics wrapper (zero overhead when disabled)
+class _SentryMetrics:
+    """Lightweight metrics wrapper - only sends if enabled."""
+    @staticmethod
+    def incr(*args, **kwargs):
+        if sentry_metrics:
+            sentry_metrics.incr(*args, **kwargs)
+    @staticmethod
+    def gauge(*args, **kwargs):
+        if sentry_metrics:
+            sentry_metrics.gauge(*args, **kwargs)
+    @staticmethod
+    def distribution(*args, **kwargs):
+        if sentry_metrics:
+            sentry_metrics.distribution(*args, **kwargs)
+
+metrics = _SentryMetrics()
+
+
+# =============================================================================
+# SENTRY EVENT FILTERS (Memory Optimization)
+# =============================================================================
+def _sentry_before_send(event, hint):
+    """
+    Filter events before sending to reduce memory and noise.
+    Return None to drop the event entirely.
+    """
+    # Drop connection reset errors (usually client disconnects)
+    if "exception" in event:
+        exc_type = event.get("exception", {}).get("values", [{}])[0].get("type", "")
+        if exc_type in ("ConnectionResetError", "BrokenPipeError", "ConnectionAbortedError"):
+            return None
+    
+    # Drop 4xx client errors (not our problem)
+    if event.get("level") == "error":
+        status_code = event.get("extra", {}).get("status_code", 500)
+        if 400 <= status_code < 500:
+            return None
+    
+    return event
+
+
+def _sentry_before_send_transaction(event, hint):
+    """
+    Filter transactions to reduce volume.
+    Drop health checks and high-frequency low-value endpoints.
+    """
+    transaction = event.get("transaction", "")
+    
+    # Skip health checks - too frequent, low value
+    if transaction in ("/health", "/", "/sentry/status", "/metrics"):
+        return None
+    
+    return event
+
+
+# Initialize Sentry (set SENTRY_DSN environment variable)
+# =============================================================================
+# MEMORY OPTIMIZATION SETTINGS
+# Set these env vars to tune Sentry memory footprint:
+#   SENTRY_TRACES_SAMPLE_RATE=0.01   (1% of requests, default 0.05)
+#   SENTRY_PROFILES_ENABLED=false    (disable profiling entirely)
+#   SENTRY_MAX_BREADCRUMBS=20        (default 100)
+# =============================================================================
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+
+# Configurable sample rates (lower = less memory)
+SENTRY_TRACES_RATE = float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.05"))  # 5% default
+SENTRY_PROFILES_ENABLED = os.environ.get("SENTRY_PROFILES_ENABLED", "false").lower() == "true"
+SENTRY_MAX_BREADCRUMBS = int(os.environ.get("SENTRY_MAX_BREADCRUMBS", "20"))  # Reduced from 100
+
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        
+        # ===== MEMORY OPTIMIZATIONS =====
+        # 1. Lower trace sampling (fewer transactions stored in memory)
+        traces_sample_rate=SENTRY_TRACES_RATE,
+        
+        # 2. Disable profiling by default (significant RAM saver)
+        #    Profiling keeps call stacks in memory - very expensive
+        profiles_sample_rate=0.05 if SENTRY_PROFILES_ENABLED else 0.0,
+        enable_tracing=SENTRY_TRACES_RATE > 0,
+        
+        # 3. Reduce breadcrumb buffer (each breadcrumb consumes memory)
+        max_breadcrumbs=SENTRY_MAX_BREADCRUMBS,
+        
+        # 4. Disable auto session tracking (reduces background memory)
+        auto_session_tracking=False,
+        
+        # 5. Limit stack trace locals (can be large objects)
+        include_local_variables=False,
+        
+        # 6. Disable source context fetching (reads files into memory)
+        include_source_context=False,
+        
+        # Environment tag
+        environment=os.environ.get("SENTRY_ENVIRONMENT", "development"),
+        # Release tag (use git commit or version)
+        release=os.environ.get("SENTRY_RELEASE", "cv-advanced-api@1.0.0"),
+        
+        # 7. Minimal integrations (each integration adds overhead)
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            StarletteIntegration(transaction_style="endpoint"),
+        ],
+        # Keep default integrations for error capturing
+        default_integrations=True,
+        
+        # Debug mode - console'da ne olduğunu gör
+        debug=True,
+        
+        # Don't send PII
+        send_default_pii=False,
+        
+        # 8. Event filtering - drop low-value events before they consume memory
+        before_send=_sentry_before_send,
+        before_send_transaction=_sentry_before_send_transaction,
+    )
+    # Set some static tags
+    with sentry_sdk.configure_scope() as scope:
+        scope.set_tag("service", "cv-advanced-api")
+        scope.set_tag("component", "inference-api")
+    print(f"[INFO] Sentry initialized (traces={SENTRY_TRACES_RATE}, profiles={'on' if SENTRY_PROFILES_ENABLED else 'off'}, breadcrumbs={SENTRY_MAX_BREADCRUMBS})")
+else:
+    print("[INFO] Sentry DSN not configured. Set SENTRY_DSN environment variable to enable.")
 
 import cv2
 import numpy as np
@@ -105,12 +257,30 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+API_HOST = os.environ.get("API_HOST", "0.0.0.0")
+API_PORT = int(os.environ.get("API_PORT", "8000"))
+DEFAULT_BACKEND = os.environ.get("DEFAULT_BACKEND", "tensorrt")
+
+# Model paths from environment
+PYTORCH_MODEL_PATH = os.environ.get("PYTORCH_MODEL_PATH", "models/latest.pt")
+ONNX_MODEL_PATH = os.environ.get("ONNX_MODEL_PATH", "models/latest.onnx")
+TENSORRT_MODEL_PATH = os.environ.get("TENSORRT_MODEL_PATH", "models/latest.fp16.engine")
+
+# Detection settings
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
+IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", "0.45"))
+INPUT_SIZE = int(os.environ.get("INPUT_SIZE", "640"))
+
+
 def get_model_path(backend: str) -> str:
     """Get model path for the specified backend."""
     paths = {
-        "tensorrt": "models/latest.fp16.engine",
-        "onnx": "models/latest.onnx", 
-        "pytorch": "models/latest.pt"
+        "tensorrt": TENSORRT_MODEL_PATH, 
+        "onnx": ONNX_MODEL_PATH, 
+        "pytorch": PYTORCH_MODEL_PATH
     }
     return paths.get(backend, paths["tensorrt"])
 
@@ -134,9 +304,9 @@ def load_detector(backend: str, force_reload: bool = False) -> Optional[Detector
             model_path=model_path,
             backend=backend,
             device=device,
-            img_size=640,
-            conf_threshold=0.25,
-            iou_threshold=0.45,
+            img_size=INPUT_SIZE,
+            conf_threshold=CONF_THRESHOLD,
+            iou_threshold=IOU_THRESHOLD,
             class_names=COCO_CLASSES,
             warmup_iterations=5
         )
@@ -155,8 +325,7 @@ async def lifespan(app: FastAPI):
     
     logger.info("Starting up server...")
     
-    import os
-    active_backend = os.getenv("BACKEND", "tensorrt")
+    active_backend = DEFAULT_BACKEND
     
     # Load default backend
     detector = load_detector(active_backend)
@@ -218,8 +387,65 @@ async def root():
             "stream": "/stream (WebSocket)",
             "backends": "/backends",
             "health": "/health",
-            "metrics": "/metrics"
+            "metrics": "/metrics",
+            "sentry_debug": "/sentry-debug"
         }
+    }
+
+
+# =============================================================================
+# Sentry Debug & Monitoring Endpoints
+# =============================================================================
+
+@app.get("/sentry-debug")
+async def trigger_sentry_error():
+    """
+    Debug endpoint to test Sentry integration.
+    Intentionally raises an error that will be captured by Sentry.
+    """
+    if not SENTRY_DSN:
+        return {
+            "status": "disabled",
+            "message": "Sentry is not configured. Set SENTRY_DSN environment variable."
+        }
+    
+    # Capture a test message
+    sentry_sdk.capture_message("Sentry test message from CV API", level="info")
+    
+    # Optionally trigger an error (uncomment to test error capture)
+    division_by_zero = 1 / 0
+    
+    return {
+        "status": "success",
+        "message": "Test message sent to Sentry",
+        "dsn_configured": True
+    }
+
+
+@app.get("/sentry/status")
+async def sentry_status():
+    """Get Sentry integration status and memory optimization settings."""
+    return {
+        "enabled": bool(SENTRY_DSN),
+        "dsn_configured": bool(SENTRY_DSN),
+        "environment": os.environ.get("SENTRY_ENVIRONMENT", "development"),
+        "release": os.environ.get("SENTRY_RELEASE", "cv-advanced-api@1.0.0"),
+        # Memory optimization settings
+        "memory_optimizations": {
+            "traces_sample_rate": SENTRY_TRACES_RATE if SENTRY_DSN else 0,
+            "profiles_enabled": SENTRY_PROFILES_ENABLED,
+            "metrics_enabled": SENTRY_METRICS_ENABLED,
+            "max_breadcrumbs": SENTRY_MAX_BREADCRUMBS,
+            "auto_session_tracking": False,
+            "include_local_variables": False,
+            "include_source_context": False,
+        },
+        "tips": [
+            "Set SENTRY_TRACES_SAMPLE_RATE=0.01 for minimal tracing",
+            "Set SENTRY_PROFILES_ENABLED=false to disable profiling (default)",
+            "Set SENTRY_METRICS_ENABLED=false to disable metrics (default)",
+            "Set SENTRY_MAX_BREADCRUMBS=10 for minimal breadcrumb buffer",
+        ]
     }
 
 
@@ -365,10 +591,16 @@ async def detect_objects(
         detector.conf_threshold = conf_threshold
     
     try:
+        # Annotate Sentry scope with request-specific tags
+        if SENTRY_DSN:
+            with sentry_sdk.configure_scope() as scope:
+                scope.set_tag("endpoint", "/detect")
+                scope.set_tag("backend", backend_str)
         # Read image
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        with sentry_sdk.start_span(op="preprocess", description="read+decode image"):
+            contents = await file.read()
+            nparr = np.frombuffer(contents, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid image file")
@@ -376,9 +608,10 @@ async def detect_objects(
         image_shape = image.shape[:2]
         
         # Run detection
-        start_time = time.perf_counter()
-        detections = detector(image)
-        end_time = time.perf_counter()
+        with sentry_sdk.start_span(op="inference", description=f"{backend_str} forward"):
+            start_time = time.perf_counter()
+            detections = detector(image)
+            end_time = time.perf_counter()
         
         inference_time_ms = (end_time - start_time) * 1000
         
@@ -388,9 +621,15 @@ async def detect_objects(
             metrics_logger.log_latency(inference_time_ms)
         if fps_meter:
             fps_meter.tick()
+        # Push lightweight metrics to Sentry (no-op if disabled)
+        metrics.incr("api.requests", tags={"endpoint": "detect", "backend": backend_str})
+        metrics.distribution("inference.latency_ms", inference_time_ms, tags={"backend": backend_str})
+        if fps_meter:
+            metrics.gauge("inference.fps", fps_meter.get_fps(), tags={"backend": backend_str})
         
         # Get timing breakdown
-        timing_stats = detector.get_timing_stats()
+        with sentry_sdk.start_span(op="postprocess", description="format response"):
+            timing_stats = detector.get_timing_stats()
         
         # Convert detections to response format
         detection_results = []
@@ -422,10 +661,21 @@ async def detect_objects(
         
         return response
         
-    except HTTPException:
+    except HTTPException as http_exc:
+        # Capture 5xx as errors in Sentry; ignore 4xx noise
+        try:
+            if SENTRY_DSN and 500 <= getattr(http_exc, "status_code", 500) < 600:
+                sentry_sdk.capture_exception(http_exc)
+        except Exception:
+            pass
         raise
     except Exception as e:
         logger.error(f"Detection failed: {e}")
+        try:
+            if SENTRY_DSN:
+                sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Restore original threshold
@@ -552,18 +802,20 @@ async def websocket_stream(
             
             try:
                 # Decode base64 image
-                frame_data = base64.b64decode(data["frame"])
-                nparr = np.frombuffer(frame_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                with sentry_sdk.start_span(op="preprocess", description="ws decode image"):
+                    frame_data = base64.b64decode(data["frame"])
+                    nparr = np.frombuffer(frame_data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
                 if frame is None:
                     await websocket.send_json({"error": "Invalid frame data"})
                     continue
                 
                 # Run detection
-                start_time = time.perf_counter()
-                detections = detector(frame)
-                inference_time = (time.perf_counter() - start_time) * 1000
+                with sentry_sdk.start_span(op="inference", description=f"{backend_str} forward (ws)"):
+                    start_time = time.perf_counter()
+                    detections = detector(frame)
+                    inference_time = (time.perf_counter() - start_time) * 1000
                 
                 # Update FPS
                 fps_counter.tick()
@@ -593,8 +845,16 @@ async def websocket_stream(
                 }
                 
                 await websocket.send_json(response)
+                # Metrics (no-op if disabled)
+                metrics.incr("ws.frames_processed", tags={"backend": backend_str})
+                metrics.distribution("ws.inference.latency_ms", inference_time, tags={"backend": backend_str})
                 
             except Exception as e:
+                try:
+                    if SENTRY_DSN:
+                        sentry_sdk.capture_exception(e)
+                except Exception:
+                    pass
                 await websocket.send_json({"error": str(e)})
                 
     except WebSocketDisconnect:
@@ -602,6 +862,11 @@ async def websocket_stream(
         logger.info("WebSocket client disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+        try:
+            if SENTRY_DSN:
+                sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
         ws_manager.disconnect(websocket)
 
 
@@ -633,17 +898,19 @@ async def process_single_frame(
     
     try:
         # Decode base64 frame
-        frame_data = base64.b64decode(frame)
-        nparr = np.frombuffer(frame_data, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        with sentry_sdk.start_span(op="preprocess", description="decode single frame"):
+            frame_data = base64.b64decode(frame)
+            nparr = np.frombuffer(frame_data, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if image is None:
             raise HTTPException(status_code=400, detail="Invalid frame data")
         
         # Run detection
-        start_time = time.perf_counter()
-        detections = detector(image)
-        inference_time_ms = (time.perf_counter() - start_time) * 1000
+        with sentry_sdk.start_span(op="inference", description=f"{backend_str} forward (single)"):
+            start_time = time.perf_counter()
+            detections = detector(image)
+            inference_time_ms = (time.perf_counter() - start_time) * 1000
         
         total_requests += 1
         if fps_meter:
@@ -661,7 +928,7 @@ async def process_single_frame(
             )
         
         # Return JSON
-        return {
+        result = {
             "detections": [
                 {
                     "bbox": {"x1": d.bbox[0], "y1": d.bbox[1], "x2": d.bbox[2], "y2": d.bbox[3]},
@@ -675,16 +942,282 @@ async def process_single_frame(
             "inference_time_ms": round(inference_time_ms, 2),
             "fps": round(fps_meter.get_fps(), 1) if fps_meter else 0
         }
+        metrics.incr("api.requests", tags={"endpoint": "stream/frame", "backend": backend_str})
+        metrics.distribution("inference.latency_ms", inference_time_ms, tags={"backend": backend_str, "mode": "single"})
+        return result
         
     except Exception as e:
         logger.error(f"Frame processing failed: {e}")
+        try:
+            if SENTRY_DSN:
+                sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Training Logs & Dashboard Endpoints
+# =============================================================================
+
+@app.get("/training/experiments")
+async def list_training_experiments():
+    """
+    List all training experiments with their basic info.
+    """
+    logs_dir = Path("training/logs")
+    
+    if not logs_dir.exists():
+        return {"experiments": [], "message": "No training logs found"}
+    
+    experiments = []
+    for exp_dir in sorted(logs_dir.iterdir(), reverse=True):
+        if exp_dir.is_dir() and exp_dir.name.startswith("exp_"):
+            exp_info = {
+                "name": exp_dir.name,
+                "path": str(exp_dir),
+                "has_results": (exp_dir / "results.csv").exists(),
+                "has_weights": (exp_dir / "weights").exists()
+            }
+            
+            # Parse date from experiment name
+            try:
+                date_str = exp_dir.name.replace("exp_", "")
+                exp_info["created"] = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} {date_str[9:11]}:{date_str[11:13]}:{date_str[13:15]}"
+            except:
+                exp_info["created"] = None
+            
+            experiments.append(exp_info)
+    
+    return {"experiments": experiments, "total": len(experiments)}
+
+
+@app.get("/training/experiments/{exp_name}/results")
+async def get_training_results(exp_name: str):
+    """
+    Get training results CSV data for a specific experiment.
+    """
+    import csv
+    
+    results_path = Path(f"training/logs/{exp_name}/results.csv")
+    
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail=f"Results not found for experiment: {exp_name}")
+    
+    with open(results_path, 'r') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    
+    # Convert to proper types
+    for row in rows:
+        for key in row:
+            try:
+                row[key] = float(row[key])
+            except:
+                pass
+    
+    # Extract key metrics
+    if rows:
+        last_epoch = rows[-1]
+        best_map50 = max(float(r.get('metrics/mAP50(B)', 0)) for r in rows)
+        best_map50_95 = max(float(r.get('metrics/mAP50-95(B)', 0)) for r in rows)
+        
+        summary = {
+            "total_epochs": len(rows),
+            "final_mAP50": float(last_epoch.get('metrics/mAP50(B)', 0)),
+            "final_mAP50_95": float(last_epoch.get('metrics/mAP50-95(B)', 0)),
+            "best_mAP50": best_map50,
+            "best_mAP50_95": best_map50_95,
+            "final_box_loss": float(last_epoch.get('train/box_loss', 0)),
+            "final_cls_loss": float(last_epoch.get('train/cls_loss', 0))
+        }
+    else:
+        summary = {}
+    
+    return {
+        "experiment": exp_name,
+        "summary": summary,
+        "epochs": rows
+    }
+
+
+@app.get("/training/experiments/{exp_name}/charts")
+async def get_training_charts(exp_name: str, chart_type: str = Query("all", enum=["all", "loss", "metrics", "mAP"])):
+    """
+    Get training chart data formatted for frontend visualization.
+    """
+    import csv
+    
+    results_path = Path(f"training/logs/{exp_name}/results.csv")
+    
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail=f"Results not found for experiment: {exp_name}")
+    
+    with open(results_path, 'r') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    
+    epochs = [int(float(r['epoch'])) for r in rows]
+    
+    charts = {}
+    
+    if chart_type in ["all", "loss"]:
+        charts["loss"] = {
+            "title": "Training Loss",
+            "x_label": "Epoch",
+            "y_label": "Loss",
+            "series": {
+                "box_loss": [float(r.get('train/box_loss', 0)) for r in rows],
+                "cls_loss": [float(r.get('train/cls_loss', 0)) for r in rows],
+                "dfl_loss": [float(r.get('train/dfl_loss', 0)) for r in rows]
+            },
+            "epochs": epochs
+        }
+    
+    if chart_type in ["all", "metrics"]:
+        charts["metrics"] = {
+            "title": "Precision & Recall",
+            "x_label": "Epoch",
+            "y_label": "Score",
+            "series": {
+                "precision": [float(r.get('metrics/precision(B)', 0)) for r in rows],
+                "recall": [float(r.get('metrics/recall(B)', 0)) for r in rows]
+            },
+            "epochs": epochs
+        }
+    
+    if chart_type in ["all", "mAP"]:
+        charts["mAP"] = {
+            "title": "Mean Average Precision",
+            "x_label": "Epoch",
+            "y_label": "mAP",
+            "series": {
+                "mAP50": [float(r.get('metrics/mAP50(B)', 0)) for r in rows],
+                "mAP50-95": [float(r.get('metrics/mAP50-95(B)', 0)) for r in rows]
+            },
+            "epochs": epochs
+        }
+    
+    return {
+        "experiment": exp_name,
+        "charts": charts
+    }
+
+
+@app.get("/training/latest")
+async def get_latest_training():
+    """
+    Get the latest training experiment results.
+    """
+    logs_dir = Path("training/logs")
+    
+    if not logs_dir.exists():
+        raise HTTPException(status_code=404, detail="No training logs found")
+    
+    # Find latest experiment
+    experiments = sorted([d for d in logs_dir.iterdir() if d.is_dir() and d.name.startswith("exp_")], reverse=True)
+    
+    if not experiments:
+        raise HTTPException(status_code=404, detail="No experiments found")
+    
+    latest = experiments[0]
+    
+    # Get results
+    return await get_training_results(latest.name)
+
+
+@app.get("/dashboard/inference")
+async def get_inference_dashboard():
+    """
+    Get real-time inference dashboard data.
+    """
+    global metrics_logger, fps_meter, total_requests, active_backend
+    
+    if not metrics_logger:
+        return {
+            "status": "no_data",
+            "message": "No inference metrics available yet. Run some detections first."
+        }
+    
+    stats = metrics_logger.get_stats()
+    latencies = list(metrics_logger.latencies)
+    
+    # GPU info
+    gpu_info = None
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(gpu_name, bytes):
+            gpu_name = gpu_name.decode('utf-8')
+        
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        
+        gpu_info = {
+            "name": gpu_name,
+            "utilization_pct": float(util.gpu),
+            "memory_used_mb": float(mem_info.used / (1024 ** 2)),
+            "memory_total_mb": float(mem_info.total / (1024 ** 2)),
+            "memory_pct": float(mem_info.used / mem_info.total * 100),
+            "temperature_c": temp
+        }
+        
+        pynvml.nvmlShutdown()
+    except:
+        pass
+    
+    return {
+        "status": "active",
+        "backend": active_backend,
+        "total_requests": total_requests,
+        "current_fps": fps_meter.get_fps() if fps_meter else 0,
+        "avg_fps": fps_meter.get_average_fps() if fps_meter else 0,
+        "latency": {
+            "avg_ms": stats.get('avg_latency_ms', 0),
+            "min_ms": stats.get('min_latency_ms', 0),
+            "max_ms": stats.get('max_latency_ms', 0),
+            "p50_ms": stats.get('p50_latency_ms', 0),
+            "p95_ms": stats.get('p95_latency_ms', 0),
+            "p99_ms": stats.get('p99_latency_ms', 0),
+            "recent_values": latencies[-50:]  # Last 50 latency values for chart
+        },
+        "gpu": gpu_info
+    }
+
+
+@app.get("/dashboard/combined")
+async def get_combined_dashboard():
+    """
+    Get combined training and inference dashboard data.
+    """
+    inference_data = await get_inference_dashboard()
+    
+    # Try to get latest training data
+    training_data = None
+    try:
+        training_data = await get_latest_training()
+    except:
+        pass
+    
+    return {
+        "inference": inference_data,
+        "training": training_data
+    }
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Global exception handler."""
     logger.error(f"Unhandled exception: {exc}")
+    try:
+        if SENTRY_DSN:
+            sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
     return JSONResponse(
         status_code=500,
         content=ErrorResponse(
@@ -697,11 +1230,11 @@ async def global_exception_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     
-    # Run server
+    # Run server with environment configuration
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
-        port=8000,
+        host=API_HOST,
+        port=API_PORT,
         reload=False,
         workers=1
     )
