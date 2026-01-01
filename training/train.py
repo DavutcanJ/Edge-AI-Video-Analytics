@@ -10,8 +10,6 @@ import torch
 import argparse
 from pathlib import Path
 from ultralytics import YOLO
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 import wandb
@@ -19,20 +17,25 @@ from datetime import datetime
 from tqdm import tqdm
 import json
 
+# Import custom augmentation pipeline
+from training.augmentations import create_detection_augmentation_pipeline
+
 
 class AdvancedTrainer:
     """Advanced training pipeline with custom augmentations and monitoring."""
     
-    def __init__(self, config_path: str, use_wandb: bool = True):
+    def __init__(self, config_path: str, use_wandb: bool = True, augment_level: str = "strong"):
         """
         Initialize trainer with configuration.
         
         Args:
             config_path: Path to dataset.yaml
             use_wandb: Enable Weights & Biases logging
+            augment_level: Augmentation intensity ('light', 'medium', 'strong')
         """
         self.config_path = config_path
         self.use_wandb = use_wandb
+        self.augment_level = augment_level
         self.project_root = Path(__file__).parent.parent
         self.logs_dir = self.project_root / "training" / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -46,114 +49,75 @@ class AdvancedTrainer:
             wandb.init(
                 project="cv-advanced-assessment",
                 name=f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                config=self.config
+                config={
+                    **self.config,
+                    "augment_level": augment_level
+                }
             )
+        
+        # Create augmentation pipeline
+        self.augmentation_pipeline = create_detection_augmentation_pipeline(
+            img_size=640,
+            augment_level=augment_level
+        )
+        print(f"[INFO] Augmentation pipeline created with level: {augment_level}")
     
-    def get_augmentations(self):
+    def get_augmentation_config(self):
         """
-        Create strong augmentation pipeline using Albumentations.
+        Get YOLO-native augmentation config based on custom pipeline level.
+        This maps our custom augmentation intensity to YOLO's native parameters.
         
         Returns:
-            Albumentations composition
+            Dictionary of YOLO augmentation parameters
         """
-        return A.Compose([
-            # Geometric transforms
-            A.RandomResizedCrop(
-                height=640, width=640,
-                scale=(0.5, 1.0),
-                ratio=(0.75, 1.33),
-                p=0.5
-            ),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.1),
-            A.ShiftScaleRotate(
-                shift_limit=0.1,
-                scale_limit=0.2,
-                rotate_limit=15,
-                border_mode=0,
-                p=0.5
-            ),
-            
-            # Color augmentations
-            A.OneOf([
-                A.ColorJitter(
-                    brightness=0.3,
-                    contrast=0.3,
-                    saturation=0.3,
-                    hue=0.1,
-                    p=1.0
-                ),
-                A.HueSaturationValue(
-                    hue_shift_limit=20,
-                    sat_shift_limit=30,
-                    val_shift_limit=20,
-                    p=1.0
-                ),
-                A.RGBShift(
-                    r_shift_limit=25,
-                    g_shift_limit=25,
-                    b_shift_limit=25,
-                    p=1.0
-                ),
-            ], p=0.5),
-            
-            # Blur and noise
-            A.OneOf([
-                A.MotionBlur(blur_limit=7, p=1.0),
-                A.MedianBlur(blur_limit=7, p=1.0),
-                A.GaussianBlur(blur_limit=7, p=1.0),
-            ], p=0.3),
-            
-            A.OneOf([
-                A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
-                A.ISONoise(
-                    color_shift=(0.01, 0.05),
-                    intensity=(0.1, 0.5),
-                    p=1.0
-                ),
-            ], p=0.2),
-            
-            # Weather and lighting
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.2,
-                    contrast_limit=0.2,
-                    p=1.0
-                ),
-                A.RandomGamma(gamma_limit=(80, 120), p=1.0),
-                A.CLAHE(clip_limit=4.0, p=1.0),
-            ], p=0.3),
-            
-            A.RandomShadow(
-                shadow_roi=(0, 0.5, 1, 1),
-                num_shadows_lower=1,
-                num_shadows_upper=2,
-                shadow_dimension=5,
-                p=0.2
-            ),
-            
-            # Cutout/Coarse Dropout
-            A.CoarseDropout(
-                max_holes=8,
-                max_height=32,
-                max_width=32,
-                min_holes=3,
-                fill_value=0,
-                p=0.3
-            ),
-            
-            # Normalization
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-                max_pixel_value=255.0,
-                p=1.0
-            ),
-        ], bbox_params=A.BboxParams(
-            format='yolo',
-            label_fields=['class_labels'],
-            min_visibility=0.3
-        ))
+        if self.augment_level == "light":
+            return {
+                'mosaic': 0.0,
+                'mixup': 0.0,
+                'copy_paste': 0.0,
+                'degrees': 0.0,
+                'translate': 0.05,
+                'scale': 0.1,
+                'shear': 0.0,
+                'perspective': 0.0,
+                'flipud': 0.0,
+                'fliplr': 0.5,
+                'hsv_h': 0.01,
+                'hsv_s': 0.3,
+                'hsv_v': 0.2,
+            }
+        elif self.augment_level == "medium":
+            return {
+                'mosaic': 0.3,
+                'mixup': 0.0,
+                'copy_paste': 0.0,
+                'degrees': 5.0,
+                'translate': 0.1,
+                'scale': 0.2,
+                'shear': 0.0,
+                'perspective': 0.0,
+                'flipud': 0.1,
+                'fliplr': 0.5,
+                'hsv_h': 0.015,
+                'hsv_s': 0.5,
+                'hsv_v': 0.3,
+            }
+        else:  # strong
+            return {
+                'mosaic': 0.5,
+                'mixup': 0.1,
+                'copy_paste': 0.1,
+                'degrees': 10.0,
+                'translate': 0.1,
+                'scale': 0.3,
+                'shear': 2.0,
+                'perspective': 0.0001,
+                'flipud': 0.1,
+                'fliplr': 0.5,
+                'hsv_h': 0.015,
+                'hsv_s': 0.7,
+                'hsv_v': 0.4,
+            }
     
     def train(
         self,
@@ -187,6 +151,9 @@ class AdvancedTrainer:
         
         model = YOLO(model_name)
         
+        # Get augmentation config based on level
+        augment_config = self.get_augmentation_config()
+        
         # Training arguments - optimized for RTX 3050 Ti (4GB VRAM)
         train_args = {
             'data': self.config_path,
@@ -208,21 +175,6 @@ class AdvancedTrainer:
             'warmup_momentum': 0.8,
             'warmup_bias_lr': 0.1,
             
-            # Augmentation settings (YOLO native) - reduced for memory
-            'mosaic': 0.5,      # Mosaic augmentation (reduced)
-            'mixup': 0.0,       # MixUp augmentation (disabled for memory)
-            'copy_paste': 0.0,  # Copy-paste augmentation (disabled for memory)
-            'degrees': 10.0,    # Rotation
-            'translate': 0.1,   # Translation
-            'scale': 0.3,       # Scale (reduced)
-            'shear': 0.0,       # Shear
-            'perspective': 0.0, # Perspective
-            'flipud': 0.0,      # Vertical flip (disabled)
-            'fliplr': 0.5,      # Horizontal flip
-            'hsv_h': 0.015,     # HSV-Hue augmentation
-            'hsv_s': 0.5,       # HSV-Saturation augmentation (reduced)
-            'hsv_v': 0.3,       # HSV-Value augmentation (reduced)
-            
             # Advanced training settings - memory optimized
             'amp': True,        # Automatic Mixed Precision (IMPORTANT for memory)
             'cos_lr': True,     # Cosine learning rate scheduler
@@ -242,6 +194,9 @@ class AdvancedTrainer:
             'val': True,
         }
         
+        # Apply custom augmentation config
+        train_args.update(augment_config)
+        
         # Update with any additional kwargs
         train_args.update(kwargs)
         
@@ -254,6 +209,10 @@ class AdvancedTrainer:
         print(f"  Workers: {workers}")
         print(f"  Learning Rate: {train_args['lr0']}")
         print(f"  Patience (Early Stopping): {patience}")
+        print(f"  Augmentation Level: {self.augment_level}")
+        print(f"\n🎨 Augmentation Settings:")
+        for key, value in augment_config.items():
+            print(f"  {key}: {value}")
         print(f"\n{'='*70}\n")
         
         # Train the model
@@ -334,15 +293,26 @@ def main():
                         help='CUDA device')
     parser.add_argument('--workers', type=int, default=8,
                         help='Number of workers')
+    parser.add_argument('--augment', type=str, default='strong',
+                        choices=['light', 'medium', 'strong'],
+                        help='Augmentation level (light/medium/strong)')
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable Weights & Biases logging')
     
     args = parser.parse_args()
     
+    print(f"\n{'='*70}")
+    print(f"🚀 Advanced Object Detection Training")
+    print(f"{'='*70}")
+    print(f"Augmentation Level: {args.augment}")
+    print(f"W&B Logging: {'Disabled' if args.no_wandb else 'Enabled'}")
+    print(f"{'='*70}\n")
+    
     # Initialize trainer
     trainer = AdvancedTrainer(
         config_path=args.config,
-        use_wandb=not args.no_wandb
+        use_wandb=not args.no_wandb,
+        augment_level=args.augment
     )
     
     # Train

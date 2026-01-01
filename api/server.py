@@ -182,6 +182,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from inference.detector import Detector
+from inference.tracker import ByteTracker, Track
+from inference.fusion import DetectionTrackerFusion
+from inference.video_engine import VideoEngine
 from api.schemas import (
     DetectionResponse,
     DetectionResult,
@@ -232,19 +235,39 @@ fps_meter: Optional[FPSMeter] = None
 total_requests: int = 0
 
 
-# WebSocket connections manager
+# WebSocket connections manager with tracking support
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        # Per-connection trackers and fusion modules
+        self.trackers: Dict[WebSocket, ByteTracker] = {}
+        self.fusion_modules: Dict[WebSocket, DetectionTrackerFusion] = {}
     
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+        # Initialize tracker and fusion for this connection
+        self.trackers[websocket] = ByteTracker(
+            track_thresh=0.5,
+            track_buffer=30,
+            match_thresh=0.8,
+            frame_rate=30
+        )
+        self.fusion_modules[websocket] = DetectionTrackerFusion(
+            iou_threshold=0.5,
+            confidence_boost=0.1,
+            max_disappeared=30
+        )
+        logger.info(f"WebSocket connected with tracking. Total connections: {len(self.active_connections)}")
     
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        # Clean up tracker and fusion
+        if websocket in self.trackers:
+            del self.trackers[websocket]
+        if websocket in self.fusion_modules:
+            del self.fusion_modules[websocket]
         logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
     
     async def broadcast(self, message: dict):
@@ -385,6 +408,11 @@ async def root():
             "detect": "/detect",
             "detect_visualize": "/detect/visualize",
             "stream": "/stream (WebSocket)",
+            "video_process": "/video/process",
+            "video_camera": "/video/camera",
+            "test_camera": "/test/camera",
+            "test_video": "/test/video",
+            "test_api": "/test/api",
             "backends": "/backends",
             "health": "/health",
             "metrics": "/metrics",
@@ -737,12 +765,13 @@ async def detect_and_visualize(
 async def websocket_stream(
     websocket: WebSocket,
     fps_limit: int = 30,
-    backend: Optional[str] = None
+    backend: Optional[str] = None,
+    enable_tracking: bool = True
 ):
     """
-    WebSocket endpoint for real-time video stream processing.
+    WebSocket endpoint for real-time video stream processing with tracking.
     
-    Client sends base64 encoded frames, server returns detections.
+    Client sends base64 encoded frames, server returns detections with track IDs.
     
     Message format (client -> server):
     {
@@ -752,8 +781,10 @@ async def websocket_stream(
     
     Message format (server -> client):
     {
-        "detections": [...],
+        "detections": [...],  # With track_id if tracking enabled
+        "tracks": [...],      # Active tracks (if tracking enabled)
         "inference_time_ms": 12.34,
+        "tracking_time_ms": 2.5,
         "fps": 30.0,
         "timestamp": 1234567890.123
     }
@@ -769,6 +800,10 @@ async def websocket_stream(
         await websocket.close()
         return
     
+    # Get tracker and fusion for this connection
+    tracker = ws_manager.trackers.get(websocket) if enable_tracking else None
+    fusion = ws_manager.fusion_modules.get(websocket) if enable_tracking else None
+    
     # FPS control
     min_frame_time = 1.0 / fps_limit if fps_limit > 0 else 0
     last_frame_time = 0
@@ -778,7 +813,8 @@ async def websocket_stream(
         await websocket.send_json({
             "status": "connected",
             "backend": backend_str,
-            "fps_limit": fps_limit
+            "fps_limit": fps_limit,
+            "tracking_enabled": enable_tracking
         })
         
         while True:
@@ -817,37 +853,81 @@ async def websocket_stream(
                     detections = detector(frame)
                     inference_time = (time.perf_counter() - start_time) * 1000
                 
+                # Run tracking if enabled
+                tracking_time = 0
+                tracks = []
+                if enable_tracking and tracker and fusion:
+                    with sentry_sdk.start_span(op="tracking", description="update tracks"):
+                        track_start = time.perf_counter()
+                        
+                        # Update tracker with detections
+                        tracks = tracker.update(detections)
+                        
+                        # Fuse tracker and detector outputs
+                        fused_tracks = fusion.fuse(detections, tracks)
+                        
+                        tracking_time = (time.perf_counter() - track_start) * 1000
+                        tracks = fused_tracks
+                
                 # Update FPS
                 fps_counter.tick()
                 
                 # Format response
                 detection_list = []
-                for det in detections:
-                    detection_list.append({
-                        "bbox": {
-                            "x1": det.bbox[0],
-                            "y1": det.bbox[1],
-                            "x2": det.bbox[2],
-                            "y2": det.bbox[3]
-                        },
-                        "confidence": det.confidence,
-                        "class_id": det.class_id,
-                        "class_name": det.class_name
-                    })
+                if enable_tracking and tracks:
+                    # Return tracks with IDs
+                    for track in tracks:
+                        detection_list.append({
+                            "track_id": track.track_id,
+                            "bbox": {
+                                "x1": track.bbox[0],
+                                "y1": track.bbox[1],
+                                "x2": track.bbox[2],
+                                "y3": track.bbox[3]
+                            },
+                            "confidence": track.confidence,
+                            "class_id": track.class_id,
+                            "state": track.state,
+                            "age": track.age,
+                            "velocity": {
+                                "vx": track.velocity[0],
+                                "vy": track.velocity[1]
+                            }
+                        })
+                else:
+                    # Return detections without track IDs
+                    for det in detections:
+                        detection_list.append({
+                            "bbox": {
+                                "x1": det.bbox[0],
+                                "y1": det.bbox[1],
+                                "x2": det.bbox[2],
+                                "y2": det.bbox[3]
+                            },
+                            "confidence": det.confidence,
+                            "class_id": det.class_id,
+                            "class_name": det.class_name
+                        })
                 
                 response = {
                     "detections": detection_list,
-                    "num_detections": len(detections),
+                    "num_detections": len(detection_list),
+                    "num_tracks": len(tracks) if enable_tracking else 0,
                     "inference_time_ms": round(inference_time, 2),
+                    "tracking_time_ms": round(tracking_time, 2) if enable_tracking else 0,
+                    "total_time_ms": round(inference_time + tracking_time, 2),
                     "fps": round(fps_counter.get_fps(), 1),
                     "timestamp": data.get("timestamp", time.time()),
-                    "frame_shape": list(frame.shape[:2])
+                    "frame_shape": list(frame.shape[:2]),
+                    "tracking_enabled": enable_tracking
                 }
                 
                 await websocket.send_json(response)
                 # Metrics (no-op if disabled)
-                metrics.incr("ws.frames_processed", tags={"backend": backend_str})
+                metrics.incr("ws.frames_processed", tags={"backend": backend_str, "tracking": str(enable_tracking)})
                 metrics.distribution("ws.inference.latency_ms", inference_time, tags={"backend": backend_str})
+                if enable_tracking:
+                    metrics.distribution("ws.tracking.latency_ms", tracking_time, tags={"backend": backend_str})
                 
             except Exception as e:
                 try:
@@ -1207,6 +1287,397 @@ async def get_combined_dashboard():
         "inference": inference_data,
         "training": training_data
     }
+
+
+# =============================================================================
+# VideoEngine Endpoints
+# =============================================================================
+
+@app.post("/video/process")
+async def process_video_file(
+    file: UploadFile = File(...),
+    backend: Optional[BackendType] = None,
+    output_format: str = Query("mp4", enum=["mp4", "avi"]),
+    visualize: bool = True,
+    max_frames: Optional[int] = None
+):
+    """
+    Process uploaded video file with detection and tracking.
+    Returns processed video with bounding boxes.
+    
+    Args:
+        file: Video file to process
+        backend: Backend to use
+        output_format: Output video format
+        visualize: Draw bounding boxes
+        max_frames: Maximum frames to process
+    """
+    import tempfile
+    import uuid
+    
+    backend_str = backend.value if backend else active_backend
+    detector = detectors.get(backend_str) or load_detector(backend_str)
+    
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Detector not available")
+    
+    # Save uploaded file temporarily
+    temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix)
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}")
+    
+    try:
+        # Write uploaded file
+        contents = await file.read()
+        temp_input.write(contents)
+        temp_input.close()
+        
+        # Create video engine
+        video_engine = VideoEngine(
+            detector=detector,
+            detection_interval=5,
+            use_threading=False
+        )
+        
+        # Process video
+        logger.info(f"Processing video: {file.filename}")
+        video_engine.process_video(
+            video_path=temp_input.name,
+            output_path=temp_output.name,
+            display=False,
+            max_frames=max_frames
+        )
+        
+        # Read processed video
+        with open(temp_output.name, 'rb') as f:
+            video_data = f.read()
+        
+        # Cleanup
+        os.unlink(temp_input.name)
+        os.unlink(temp_output.name)
+        
+        return StreamingResponse(
+            io.BytesIO(video_data),
+            media_type=f"video/{output_format}",
+            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Video processing failed: {e}")
+        try:
+            os.unlink(temp_input.name)
+            os.unlink(temp_output.name)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/video/camera")
+async def process_camera_stream(
+    camera_id: int = Query(0, ge=0, le=10),
+    backend: Optional[BackendType] = None,
+    duration_seconds: int = Query(10, ge=1, le=300),
+    fps: int = Query(30, ge=1, le=60)
+):
+    """
+    Process camera stream and return as video.
+    
+    Args:
+        camera_id: Camera device ID (0 for default)
+        backend: Backend to use
+        duration_seconds: Recording duration
+        fps: Output video FPS
+    """
+    import tempfile
+    
+    backend_str = backend.value if backend else active_backend
+    detector = detectors.get(backend_str) or load_detector(backend_str)
+    
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Detector not available")
+    
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    
+    try:
+        # Create video engine
+        video_engine = VideoEngine(
+            detector=detector,
+            detection_interval=3,
+            use_threading=False
+        )
+        
+        # Calculate max frames
+        max_frames = duration_seconds * fps
+        
+        # Process camera
+        logger.info(f"Processing camera {camera_id} for {duration_seconds}s")
+        video_engine.process_video(
+            video_path=camera_id,
+            output_path=temp_output.name,
+            display=False,
+            max_frames=max_frames
+        )
+        
+        # Read processed video
+        with open(temp_output.name, 'rb') as f:
+            video_data = f.read()
+        
+        # Cleanup
+        os.unlink(temp_output.name)
+        
+        return StreamingResponse(
+            io.BytesIO(video_data),
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename=camera_{camera_id}_processed.mp4"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Camera processing failed: {e}")
+        try:
+            os.unlink(temp_output.name)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Test Endpoints
+# =============================================================================
+
+@app.get("/test/camera")
+async def test_camera(camera_id: int = Query(0, ge=0, le=10)):
+    """
+    Test camera access and return basic info.
+    
+    Args:
+        camera_id: Camera device ID
+    """
+    try:
+        cap = cv2.VideoCapture(camera_id)
+        
+        if not cap.isOpened():
+            return {
+                "status": "error",
+                "camera_id": camera_id,
+                "accessible": False,
+                "message": f"Camera {camera_id} not accessible"
+            }
+        
+        # Get camera properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        # Try to read a frame
+        ret, frame = cap.read()
+        frame_read = ret and frame is not None
+        
+        cap.release()
+        
+        return {
+            "status": "success",
+            "camera_id": camera_id,
+            "accessible": True,
+            "properties": {
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "frame_read_test": frame_read
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "camera_id": camera_id,
+            "accessible": False,
+            "error": str(e)
+        }
+
+
+@app.post("/test/video")
+async def test_video_file(file: UploadFile = File(...)):
+    """
+    Test video file and return properties.
+    
+    Args:
+        file: Video file to test
+    """
+    import tempfile
+    
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix)
+    
+    try:
+        # Save uploaded file
+        contents = await file.read()
+        temp_file.write(contents)
+        temp_file.close()
+        
+        # Open video
+        cap = cv2.VideoCapture(temp_file.name)
+        
+        if not cap.isOpened():
+            os.unlink(temp_file.name)
+            return {
+                "status": "error",
+                "filename": file.filename,
+                "readable": False,
+                "message": "Video file not readable"
+            }
+        
+        # Get properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0
+        
+        # Try to read first frame
+        ret, frame = cap.read()
+        frame_read = ret and frame is not None
+        
+        cap.release()
+        os.unlink(temp_file.name)
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "readable": True,
+            "properties": {
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "frame_count": frame_count,
+                "duration_seconds": round(duration, 2),
+                "first_frame_read_test": frame_read
+            }
+        }
+        
+    except Exception as e:
+        try:
+            os.unlink(temp_file.name)
+        except:
+            pass
+        return {
+            "status": "error",
+            "filename": file.filename,
+            "readable": False,
+            "error": str(e)
+        }
+
+
+@app.get("/test/api")
+async def test_api_features():
+    """
+    Test all API features and return status report.
+    """
+    report = {
+        "timestamp": time.time(),
+        "tests": {}
+    }
+    
+    # Test 1: Backend availability
+    backends_test = {}
+    for backend_name in ["pytorch", "onnx", "tensorrt"]:
+        model_path = get_model_path(backend_name)
+        model_exists = Path(model_path).exists()
+        loaded = backend_name in detectors
+        
+        # Try loading if not loaded
+        if model_exists and not loaded:
+            try:
+                load_detector(backend_name)
+                loaded = backend_name in detectors
+            except:
+                pass
+        
+        backends_test[backend_name] = {
+            "model_exists": model_exists,
+            "loaded": loaded,
+            "status": "ok" if (model_exists and loaded) else "fail"
+        }
+    
+    report["tests"]["backends"] = backends_test
+    
+    # Test 2: GPU availability
+    gpu_test = {
+        "cuda_available": torch.cuda.is_available(),
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0
+    }
+    
+    if torch.cuda.is_available():
+        try:
+            gpu_test["device_name"] = torch.cuda.get_device_name(0)
+            gpu_test["status"] = "ok"
+        except:
+            gpu_test["status"] = "fail"
+    else:
+        gpu_test["status"] = "warning"
+        gpu_test["message"] = "CUDA not available, using CPU"
+    
+    report["tests"]["gpu"] = gpu_test
+    
+    # Test 3: Detector functionality
+    detector_test = {}
+    active_detector = detectors.get(active_backend)
+    
+    if active_detector:
+        try:
+            # Create dummy image
+            dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
+            
+            # Run detection
+            start = time.perf_counter()
+            detections = active_detector(dummy_image)
+            latency_ms = (time.perf_counter() - start) * 1000
+            
+            detector_test["status"] = "ok"
+            detector_test["latency_ms"] = round(latency_ms, 2)
+            detector_test["num_detections"] = len(detections)
+        except Exception as e:
+            detector_test["status"] = "fail"
+            detector_test["error"] = str(e)
+    else:
+        detector_test["status"] = "fail"
+        detector_test["message"] = "No active detector"
+    
+    report["tests"]["detector"] = detector_test
+    
+    # Test 4: Tracking functionality
+    tracking_test = {}
+    try:
+        tracker = ByteTracker()
+        tracking_test["status"] = "ok"
+        tracking_test["message"] = "Tracker initialized successfully"
+    except Exception as e:
+        tracking_test["status"] = "fail"
+        tracking_test["error"] = str(e)
+    
+    report["tests"]["tracking"] = tracking_test
+    
+    # Test 5: Sentry integration
+    sentry_test = {
+        "enabled": bool(SENTRY_DSN),
+        "status": "ok" if SENTRY_DSN else "disabled"
+    }
+    
+    report["tests"]["sentry"] = sentry_test
+    
+    # Overall status
+    all_ok = all(
+        test.get("status") in ["ok", "disabled", "warning"]
+        for test in report["tests"].values()
+        if isinstance(test, dict)
+    )
+    
+    backend_tests_ok = all(
+        b["status"] == "ok"
+        for b in backends_test.values()
+    )
+    
+    report["overall_status"] = "healthy" if (all_ok and backend_tests_ok) else "degraded"
+    report["active_backend"] = active_backend
+    
+    return report
 
 
 @app.exception_handler(Exception)

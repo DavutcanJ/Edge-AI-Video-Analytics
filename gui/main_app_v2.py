@@ -191,12 +191,24 @@ class EdgeAIManager(ctk.CTk):
         """Stop the FastAPI server."""
         logger.info("Stopping API server")
         if self.api_process:
-            self.api_process.terminate()
-            self.api_process = None
+            try:
+                self.api_process.terminate()
+                self.api_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.api_process.kill()
+            except Exception as e:
+                logger.error(f"Error stopping API: {e}")
+            finally:
+                self.api_process = None
+                self.api_status_label.configure(text="Status: ⚪ Stopped")
+                self.start_api_btn.configure(state="normal")
+                self.stop_api_btn.configure(state="disabled")
+                self._append_api_log("Server stopped.\n")
+        else:
+            logger.warning("No API process to stop")
             self.api_status_label.configure(text="Status: ⚪ Stopped")
             self.start_api_btn.configure(state="normal")
             self.stop_api_btn.configure(state="disabled")
-            self._append_api_log("Server stopped.\n")
     
     def _append_api_log(self, text):
         """Append text to API log."""
@@ -689,19 +701,30 @@ class EdgeAIManager(ctk.CTk):
             max_size = (640, 480)
             img.thumbnail(max_size, Image.Resampling.LANCZOS)
             
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGBA")
+            # Convert to RGB to avoid mode issues
+            if img.mode != "RGB":
+                img = img.convert("RGB")
             
             # Clear previous image to free memory
             if self.displayed_image:
-                del self.displayed_image
+                try:
+                    # Clear the label first to release reference
+                    self.test_image_label.configure(image="", text="")
+                    del self.displayed_image
+                except:
+                    pass
             
+            # CRITICAL FIX: Keep reference and use configure properly
             self.displayed_image = CTkImage(light_image=img, dark_image=img, size=img.size)
+            # Use after() to ensure GUI is ready
             self.test_image_label.configure(image=self.displayed_image, text="")
+            # Force update
+            self.test_image_label.update_idletasks()
             logger.debug("Image displayed successfully")
             
         except Exception as e:
             logger.error(f"Failed to display image: {e}", exc_info=True)
+            self.test_image_label.configure(text=f"Error: {str(e)[:50]}")
             messagebox.showerror("Error", f"Failed to display image: {e}")
     
     def detect_objects(self):
@@ -924,20 +947,36 @@ class EdgeAIManager(ctk.CTk):
                 img_pil = Image.fromarray(frame_rgb)
                 img_pil.thumbnail((640, 480), Image.Resampling.LANCZOS)
                 
-                # Create CTkImage in main thread
+                # CRITICAL FIX: Clear old image reference first
+                if self.displayed_image:
+                    try:
+                        # Set label to empty first to release reference
+                        self.test_image_label.configure(image="")
+                        # Delete old image
+                        del self.displayed_image
+                        self.displayed_image = None
+                    except:
+                        pass
+                
+                # Create NEW CTkImage in main thread
                 ctk_img = CTkImage(light_image=img_pil, dark_image=img_pil, size=img_pil.size)
                 
-                # Update label
+                # Update label with new image
                 self.test_image_label.configure(image=ctk_img, text="")
-                self.displayed_image = ctk_img  # Keep reference
+                
+                # Keep reference to prevent garbage collection
+                self.displayed_image = ctk_img
                 
                 # Update stats
                 self.test_stats_label.configure(
                     text=f"FPS: {fps} | Inference: {inf_time:.1f}ms | Detections: {det_count}"
                 )
                 
-            except:
-                pass  # Queue empty
+            except Exception as e:
+                # Queue empty or other error
+                if str(e) and "Empty" not in str(e):
+                    logger.debug(f"Queue error: {e}")
+                pass
             
             # Schedule next update (every 33ms = ~30 FPS)
             if self.camera_running:
@@ -965,14 +1004,28 @@ class EdgeAIManager(ctk.CTk):
                 pass
         
         # Wait for thread to finish
-        if self.camera_thread and self.camera_thread.is_alive():
-            self.camera_thread.join(timeout=1.0)
+        if hasattr(self, 'camera_thread') and self.camera_thread and self.camera_thread.is_alive():
+            logger.info("Waiting for camera thread to finish")
+            self.camera_thread.join(timeout=2.0)
+            if self.camera_thread.is_alive():
+                logger.warning("Camera thread did not finish in time")
         
         # Clear image
-        self.test_image_label.configure(image=None, text="Camera stopped")
+        try:
+            self.test_image_label.configure(image=None, text="Camera stopped")
+        except:
+            pass
+        
         if self.displayed_image:
-            del self.displayed_image
+            try:
+                del self.displayed_image
+            except:
+                pass
             self.displayed_image = None
+        
+        # Re-enable buttons
+        self.start_cam_btn.configure(state="normal")
+        self.stop_cam_btn.configure(state="disabled")
         
         logger.info("Camera stopped successfully")
     
@@ -980,13 +1033,16 @@ class EdgeAIManager(ctk.CTk):
     # MONITORING TAB
     # =========================================================================
     def _setup_monitoring_tab(self):
-        """Setup monitoring/dashboard tab."""
+        """Setup monitoring/dashboard tab with TensorBoard and WandB integration."""
         logger.debug("Setting up Monitoring tab")
         
         main_frame = ctk.CTkFrame(self.tab_monitoring)
         main_frame.pack(fill="both", expand=True, padx=20, pady=20)
         
-        ctk.CTkLabel(main_frame, text="System Monitoring", font=("Arial", 20, "bold")).pack(pady=10)
+        # Title with integration indicators
+        title_frame = ctk.CTkFrame(main_frame)
+        title_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(title_frame, text="System Monitoring & Training Logs", font=("Arial", 20, "bold")).pack(side="left", padx=10)
         
         # Stats cards
         cards_frame = ctk.CTkFrame(main_frame)
@@ -1028,6 +1084,52 @@ class EdgeAIManager(ctk.CTk):
         self.model_classes_label = ctk.CTkLabel(model_card, text="Classes: --", font=("Arial", 12))
         self.model_classes_label.pack(pady=5)
         
+        # TensorBoard & WandB Section
+        monitoring_frame = ctk.CTkFrame(main_frame)
+        monitoring_frame.pack(fill="x", pady=20, padx=20)
+        
+        ctk.CTkLabel(monitoring_frame, text="Training Visualization Tools", font=("Arial", 16, "bold")).pack(pady=10)
+        
+        # TensorBoard controls
+        tb_frame = ctk.CTkFrame(monitoring_frame)
+        tb_frame.pack(fill="x", pady=10, padx=10)
+        
+        ctk.CTkLabel(tb_frame, text="📊 TensorBoard", font=("Arial", 14, "bold")).pack(side="left", padx=10)
+        
+        self.tensorboard_status_label = ctk.CTkLabel(tb_frame, text="⚪ Not Running", font=("Arial", 12))
+        self.tensorboard_status_label.pack(side="left", padx=10)
+        
+        self.tensorboard_port_var = ctk.StringVar(value="6006")
+        ctk.CTkLabel(tb_frame, text="Port:").pack(side="left", padx=5)
+        ctk.CTkEntry(tb_frame, textvariable=self.tensorboard_port_var, width=80).pack(side="left", padx=5)
+        
+        self.start_tensorboard_btn = ctk.CTkButton(
+            tb_frame, text="▶️ Start", command=self.start_tensorboard,
+            fg_color="green", width=100
+        )
+        self.start_tensorboard_btn.pack(side="left", padx=5)
+        
+        self.stop_tensorboard_btn = ctk.CTkButton(
+            tb_frame, text="⏹️ Stop", command=self.stop_tensorboard,
+            fg_color="red", width=100, state="disabled"
+        )
+        self.stop_tensorboard_btn.pack(side="left", padx=5)
+        
+        ctk.CTkButton(tb_frame, text="🌐 Open in Browser", command=self.open_tensorboard, width=150).pack(side="left", padx=5)
+        
+        # WandB controls
+        wandb_frame = ctk.CTkFrame(monitoring_frame)
+        wandb_frame.pack(fill="x", pady=10, padx=10)
+        
+        ctk.CTkLabel(wandb_frame, text="🏃 Weights & Biases", font=("Arial", 14, "bold")).pack(side="left", padx=10)
+        
+        self.wandb_status_label = ctk.CTkLabel(wandb_frame, text="⚪ Not Configured", font=("Arial", 12))
+        self.wandb_status_label.pack(side="left", padx=10)
+        
+        ctk.CTkButton(wandb_frame, text="🔑 Configure API Key", command=self.configure_wandb, width=150).pack(side="left", padx=5)
+        ctk.CTkButton(wandb_frame, text="🌐 Open Dashboard", command=self.open_wandb_dashboard, width=150).pack(side="left", padx=5)
+        ctk.CTkButton(wandb_frame, text="📊 View Latest Run", command=self.view_latest_wandb_run, width=150).pack(side="left", padx=5)
+        
         # Controls
         controls_frame = ctk.CTkFrame(main_frame)
         controls_frame.pack(fill="x", pady=10, padx=20)
@@ -1038,15 +1140,21 @@ class EdgeAIManager(ctk.CTk):
         ctk.CTkCheckBox(controls_frame, text="Auto-refresh (5s)", variable=self.auto_refresh_var, 
                        command=self.toggle_auto_refresh).pack(side="left", padx=10)
         
-        ctk.CTkButton(controls_frame, text="📈 Open Dashboard", command=self.open_dashboard, width=200).pack(side="right", padx=10)
+        ctk.CTkButton(controls_frame, text="📈 Open API Dashboard", command=self.open_dashboard, width=200).pack(side="right", padx=10)
         
         # Logs
-        ctk.CTkLabel(main_frame, text="Recent API Logs", font=("Arial", 14, "bold")).pack(pady=10)
-        self.monitor_log = ctk.CTkTextbox(main_frame, width=1000, height=300)
+        ctk.CTkLabel(main_frame, text="Recent System Logs", font=("Arial", 14, "bold")).pack(pady=10)
+        self.monitor_log = ctk.CTkTextbox(main_frame, width=1000, height=200)
         self.monitor_log.pack(pady=10, padx=20, fill="both", expand=True)
         
+        # TensorBoard state
+        self.tensorboard_process = None
+        
+        # Check WandB configuration
+        self.check_wandb_config()
+        
         self.auto_refresh_running = False
-        logger.debug("Monitoring tab setup complete")
+        logger.debug("Monitoring tab setup complete with TensorBoard/WandB integration")
     
     def refresh_metrics(self):
         """Refresh monitoring metrics."""
@@ -1090,10 +1198,170 @@ class EdgeAIManager(ctk.CTk):
             self.after(5000, self._auto_refresh_loop)
     
     def open_dashboard(self):
-        """Open browser dashboard."""
-        logger.info("Opening API dashboard")
+        """Open API dashboard in browser."""
         import webbrowser
-        webbrowser.open(f"{API_URL}/docs")
+        url = f"{API_URL}/dashboard/combined"
+        logger.info(f"Opening dashboard: {url}")
+        webbrowser.open(url)
+    
+    # =========================================================================
+    # TensorBoard & WandB Methods
+    # =========================================================================
+    
+    def start_tensorboard(self):
+        """Start TensorBoard server."""
+        try:
+            port = self.tensorboard_port_var.get()
+            logdir = PROJECT_ROOT / "training" / "logs"
+            
+            if not logdir.exists():
+                messagebox.showwarning("No Logs", f"Training logs directory not found: {logdir}")
+                return
+            
+            logger.info(f"Starting TensorBoard on port {port}")
+            self.tensorboard_process = subprocess.Popen(
+                ["tensorboard", "--logdir", str(logdir), "--port", port, "--bind_all"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(PROJECT_ROOT)
+            )
+            
+            self.tensorboard_status_label.configure(text=f"🟢 Running on :{port}")
+            self.start_tensorboard_btn.configure(state="disabled")
+            self.stop_tensorboard_btn.configure(state="normal")
+            
+            self.monitor_log.insert("end", f"✅ TensorBoard started on port {port}\n")
+            self.monitor_log.insert("end", f"   Open: http://localhost:{port}\n")
+            messagebox.showinfo("TensorBoard Started", f"TensorBoard is running on http://localhost:{port}")
+            
+        except FileNotFoundError:
+            messagebox.showerror("TensorBoard Not Found", 
+                               "TensorBoard not installed. Install with:\npip install tensorboard")
+        except Exception as e:
+            logger.error(f"Failed to start TensorBoard: {e}")
+            messagebox.showerror("Error", f"Failed to start TensorBoard:\n{str(e)}")
+    
+    def stop_tensorboard(self):
+        """Stop TensorBoard server."""
+        if self.tensorboard_process:
+            try:
+                self.tensorboard_process.terminate()
+                self.tensorboard_process.wait(timeout=5)
+                self.tensorboard_process = None
+                
+                self.tensorboard_status_label.configure(text="⚪ Not Running")
+                self.start_tensorboard_btn.configure(state="normal")
+                self.stop_tensorboard_btn.configure(state="disabled")
+                
+                self.monitor_log.insert("end", "⏹️ TensorBoard stopped\n")
+                logger.info("TensorBoard stopped")
+                
+            except Exception as e:
+                logger.error(f"Error stopping TensorBoard: {e}")
+                messagebox.showerror("Error", f"Error stopping TensorBoard:\n{str(e)}")
+    
+    def open_tensorboard(self):
+        """Open TensorBoard in browser."""
+        port = self.tensorboard_port_var.get()
+        url = f"http://localhost:{port}"
+        
+        import webbrowser
+        logger.info(f"Opening TensorBoard: {url}")
+        
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open browser:\n{str(e)}")
+    
+    def check_wandb_config(self):
+        """Check if WandB is configured."""
+        try:
+            import wandb
+            api_key = os.environ.get("WANDB_API_KEY")
+            
+            if api_key:
+                # Try to verify the key
+                try:
+                    api = wandb.Api()
+                    self.wandb_status_label.configure(text="🟢 Configured")
+                    self.monitor_log.insert("end", "✅ WandB API key found and valid\n")
+                except Exception:
+                    self.wandb_status_label.configure(text="🟡 Key Invalid")
+                    self.monitor_log.insert("end", "⚠️ WandB API key found but invalid\n")
+            else:
+                self.wandb_status_label.configure(text="⚪ Not Configured")
+                
+        except ImportError:
+            self.wandb_status_label.configure(text="❌ Not Installed")
+            self.monitor_log.insert("end", "❌ WandB not installed. Install with: pip install wandb\n")
+    
+    def configure_wandb(self):
+        """Configure WandB API key."""
+        dialog = ctk.CTkInputDialog(
+            text="Enter your Weights & Biases API key:\n(Get it from https://wandb.ai/settings)",
+            title="Configure WandB"
+        )
+        api_key = dialog.get_input()
+        
+        if api_key:
+            try:
+                # Save to environment
+                os.environ["WANDB_API_KEY"] = api_key
+                
+                # Save to .env file
+                env_file = PROJECT_ROOT / ".env"
+                with open(env_file, "a") as f:
+                    f.write(f"\nWANDB_API_KEY={api_key}\n")
+                
+                # Verify
+                import wandb
+                wandb.login(key=api_key)
+                
+                self.wandb_status_label.configure(text="🟢 Configured")
+                self.monitor_log.insert("end", "✅ WandB API key configured successfully\n")
+                messagebox.showinfo("Success", "WandB API key configured!")
+                
+            except Exception as e:
+                logger.error(f"WandB configuration failed: {e}")
+                messagebox.showerror("Error", f"Failed to configure WandB:\n{str(e)}")
+    
+    def open_wandb_dashboard(self):
+        """Open WandB dashboard in browser."""
+        import webbrowser
+        url = "https://wandb.ai/home"
+        logger.info(f"Opening WandB dashboard: {url}")
+        webbrowser.open(url)
+    
+    def view_latest_wandb_run(self):
+        """View latest WandB run in browser."""
+        try:
+            # Find latest run from wandb directory
+            wandb_dir = PROJECT_ROOT / "wandb"
+            if not wandb_dir.exists():
+                messagebox.showinfo("No Runs", "No WandB runs found in this project.")
+                return
+            
+            # Find latest run directory
+            run_dirs = sorted([d for d in wandb_dir.iterdir() if d.is_dir() and d.name.startswith("run-")], 
+                            key=lambda x: x.stat().st_mtime, reverse=True)
+            
+            if not run_dirs:
+                messagebox.showinfo("No Runs", "No WandB runs found.")
+                return
+            
+            latest_run = run_dirs[0]
+            
+            # Try to extract run URL from run directory
+            import webbrowser
+            # Default to project page
+            url = "https://wandb.ai/home"
+            
+            self.monitor_log.insert("end", f"📊 Latest run: {latest_run.name}\n")
+            webbrowser.open(url)
+            
+        except Exception as e:
+            logger.error(f"Error viewing WandB run: {e}")
+            messagebox.showerror("Error", f"Error viewing WandB run:\n{str(e)}")
     
     # =========================================================================
     # CLEANUP
@@ -1110,6 +1378,11 @@ class EdgeAIManager(ctk.CTk):
         if self.camera_thread and self.camera_thread.is_alive():
             logger.info("Waiting for camera thread to finish")
             self.camera_thread.join(timeout=2.0)
+        
+        # Stop TensorBoard if running
+        if hasattr(self, 'tensorboard_process') and self.tensorboard_process:
+            logger.info("Terminating TensorBoard")
+            self.tensorboard_process.terminate()
         
         # Stop processes
         if self.api_process:
