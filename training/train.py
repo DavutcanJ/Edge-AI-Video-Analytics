@@ -279,8 +279,8 @@ class AdvancedTrainer:
 def main():
     """Main training entry point."""
     parser = argparse.ArgumentParser(description='Train object detection model')
-    parser.add_argument('--config', type=str, default='training/dataset.yaml',
-                        help='Path to dataset configuration')
+    parser.add_argument('--data', '--config', type=str, default='training/dataset.yaml',
+                        help='Path to dataset configuration (dataset.yaml)')
     parser.add_argument('--model', type=str, default='yolov8n.pt',
                         help='Model architecture')
     parser.add_argument('--epochs', type=int, default=100,
@@ -289,28 +289,41 @@ def main():
                         help='Batch size')
     parser.add_argument('--imgsz', type=int, default=640,
                         help='Image size')
+    parser.add_argument('--lr', type=float, default=0.01,
+                        help='Learning rate')
     parser.add_argument('--device', type=str, default='0',
                         help='CUDA device')
     parser.add_argument('--workers', type=int, default=8,
                         help='Number of workers')
-    parser.add_argument('--augment', type=str, default='strong',
+    parser.add_argument('--augment', type=str, default='medium',
                         choices=['light', 'medium', 'strong'],
                         help='Augmentation level (light/medium/strong)')
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable Weights & Biases logging')
+    parser.add_argument('--project', type=str, default=None,
+                        help='Project name (for W&B or local)')
+    parser.add_argument('--save-period', type=int, default=-1,
+                        help='Save checkpoint every N epochs (-1 to disable)')
+    parser.add_argument('--amp', type=str, default='True',
+                        help='Use automatic mixed precision')
     
     args = parser.parse_args()
     
     print(f"\n{'='*70}")
     print(f"🚀 Advanced Object Detection Training")
     print(f"{'='*70}")
+    print(f"Dataset: {args.data}")
+    print(f"Model: {args.model}")
+    print(f"Epochs: {args.epochs}, Batch: {args.batch}, Image Size: {args.imgsz}")
+    print(f"Learning Rate: {args.lr}")
     print(f"Augmentation Level: {args.augment}")
     print(f"W&B Logging: {'Disabled' if args.no_wandb else 'Enabled'}")
+    print(f"AMP: {args.amp}")
     print(f"{'='*70}\n")
     
     # Initialize trainer
     trainer = AdvancedTrainer(
-        config_path=args.config,
+        config_path=args.data,
         use_wandb=not args.no_wandb,
         augment_level=args.augment
     )
@@ -322,7 +335,9 @@ def main():
         batch=args.batch,
         imgsz=args.imgsz,
         device=args.device,
-        workers=args.workers
+        workers=args.workers,
+        lr0=args.lr,
+        save_period=args.save_period if args.save_period > 0 else -1
     )
 
 
