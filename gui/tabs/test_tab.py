@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 import cv2
 import time
+import queue
 
 from .base_tab import BaseTab
 
@@ -25,11 +26,11 @@ class TestTab(BaseTab):
     
     def __init__(self, app, parent):
         super().__init__(app, parent)
-        self.loaded_image = None
+        self.loaded_image_path = None
         self.displayed_image = None
-        self.camera_active = False
+        self.camera_running = False
         self.camera_thread = None
-        self.cap = None
+        self.frame_queue = None
     
     def setup(self):
         """Setup test tab UI"""
@@ -157,6 +158,14 @@ class TestTab(BaseTab):
     
     def _load_image(self):
         """Load image for testing"""
+        logger.debug("Loading test image")
+        
+        # CRITICAL: Stop camera before loading image
+        if self.camera_running:
+            logger.info("Stopping camera before loading image")
+            self._stop_camera()
+            time.sleep(0.2)
+        
         path = filedialog.askopenfilename(
             title="Select Image",
             filetypes=[
@@ -169,7 +178,7 @@ class TestTab(BaseTab):
             return
         
         try:
-            self.loaded_image = path
+            self.loaded_image_path = path
             img = Image.open(path)
             
             # Resize for display
@@ -207,7 +216,7 @@ class TestTab(BaseTab):
     
     def _detect_objects(self):
         """Run object detection"""
-        if not self.loaded_image:
+        if not self.loaded_image_path:
             messagebox.showwarning("Warning", "Please load an image first")
             return
         
@@ -215,8 +224,8 @@ class TestTab(BaseTab):
         
         def run():
             try:
-                with open(self.loaded_image, "rb") as f:
-                    files = {"file": (self.loaded_image, f, "image/png")}
+                with open(self.loaded_image_path, "rb") as f:
+                    files = {"file": (self.loaded_image_path, f, "image/png")}
                     params = {"backend": self.widgets['backend_var'].get()}
                     
                     response = requests.post(
@@ -260,7 +269,7 @@ class TestTab(BaseTab):
     
     def _visualize_detections(self):
         """Get visualized results"""
-        if not self.loaded_image:
+        if not self.loaded_image_path:
             messagebox.showwarning("Warning", "Please load an image first")
             return
         
@@ -268,8 +277,8 @@ class TestTab(BaseTab):
         
         def run():
             try:
-                with open(self.loaded_image, "rb") as f:
-                    files = {"file": (self.loaded_image, f, "image/png")}
+                with open(self.loaded_image_path, "rb") as f:
+                    files = {"file": (self.loaded_image_path, f, "image/png")}
                     params = {"backend": self.widgets['backend_var'].get()}
                     
                     response = requests.post(
@@ -312,151 +321,222 @@ class TestTab(BaseTab):
     
     def _toggle_camera(self):
         """Toggle camera on/off"""
-        if self.camera_active:
+        if self.camera_running:
             self._stop_camera()
         else:
             self._start_camera()
     
     def _start_camera(self):
-        """Start camera stream"""
-        if self.camera_active:
-            return
+        """Start live camera detection - SAFE VERSION with queue"""
+        logger.info("Starting camera")
         
-        try:
-            # Get camera source
-            cam_source = self.widgets['camera_var'].get()
+        # CRITICAL: Ensure camera is fully stopped before starting
+        if self.camera_running:
+            logger.warning("Camera already running, stopping first")
+            self._stop_camera()
+            time.sleep(0.3)
+        
+        self.camera_running = True
+        self.widgets['start_camera_btn'].configure(
+            text="⏹️ Stop Camera",
+            fg_color="#C92A2A"
+        )
+        
+        # Clear loaded image to prevent conflicts
+        self.loaded_image_path = None
+        
+        # Create frame queue for thread-safe communication
+        self.frame_queue = queue.Queue(maxsize=2)
+        
+        def camera_loop():
+            cap = None
             try:
-                cam_source = int(cam_source)
-            except ValueError:
-                pass  # Keep as string (file path or URL)
+                cam_source = self.widgets['camera_var'].get()
+                try:
+                    cam_source = int(cam_source)
+                except:
+                    pass
+            except:
+                cam_source = 0
             
-            # Open camera
-            self.cap = cv2.VideoCapture(cam_source)
-            if not self.cap.isOpened():
-                messagebox.showerror("Error", f"Failed to open camera: {cam_source}")
+            logger.info(f"Opening camera {cam_source}")
+            cap = cv2.VideoCapture(cam_source)
+            
+            if not cap.isOpened():
+                logger.error(f"Failed to open camera {cam_source}")
+                self.app.after(0, lambda: messagebox.showerror("Error", f"Failed to open camera {cam_source}"))
+                self.camera_running = False
+                self.app.after(0, lambda: self.widgets['start_camera_btn'].configure(
+                    text="📹 Start Camera", fg_color="#1971C2"
+                ))
                 return
             
-            self.camera_active = True
-            self.widgets['start_camera_btn'].configure(
-                text="⏹️ Stop Camera",
-                fg_color="#C92A2A"
-            )
+            # Set camera properties for better performance
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
             
-            # Start camera thread
-            self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
-            self.camera_thread.start()
+            logger.info("Camera opened successfully, starting loop")
             
-            logger.info(f"Camera started: {cam_source}")
+            frame_count = 0
+            fps_times = []
+            last_detection_time = 0
+            detection_interval = 0.5  # Detect every 500ms
+            current_detections = []
+            current_inf_time = 0
             
-        except Exception as e:
-            logger.error(f"Failed to start camera: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Failed to start camera:\n{e}")
+            logger.info(f"Entering main camera loop, camera_running={self.camera_running}")
+            
+            while self.camera_running and cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("Failed to read frame from camera")
+                    break
+                
+                frame_count += 1
+                
+                # Log first few frames
+                if frame_count <= 3:
+                    logger.info(f"Read frame {frame_count}: shape={frame.shape}")
+                elif frame_count == 4:
+                    logger.info("Camera reading frames normally")
+                
+                current_time = time.time()
+                
+                # Calculate FPS
+                fps_times.append(current_time)
+                fps_times = [t for t in fps_times if current_time - t < 1.0]
+                fps = len(fps_times)
+                
+                # Run detection periodically
+                if current_time - last_detection_time >= detection_interval:
+                    last_detection_time = current_time
+                    
+                    # Run detection in separate thread
+                    def run_detection():
+                        try:
+                            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                            files = {"file": ("frame.jpg", buffer.tobytes(), "image/jpeg")}
+                            params = {"backend": self.widgets['backend_var'].get()}
+                            r = requests.post(f"{API_URL}/detect", files=files, params=params, timeout=2)
+                            
+                            if r.status_code == 200:
+                                result = r.json()
+                                nonlocal current_detections, current_inf_time
+                                current_detections = result.get("detections", [])
+                                current_inf_time = result.get("inference_time_ms", 0)
+                        except Exception as e:
+                            if frame_count % 30 == 0:  # Log occasionally
+                                logger.warning(f"Detection failed: {e}")
+                    
+                    threading.Thread(target=run_detection, daemon=True).start()
+                
+                # Draw detections on frame
+                display_frame = frame.copy()
+                for det in current_detections:
+                    bbox = det.get("bbox", {})
+                    x1, y1 = int(bbox.get("x1", 0)), int(bbox.get("y1", 0))
+                    x2, y2 = int(bbox.get("x2", 0)), int(bbox.get("y2", 0))
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"{det['class_name']}: {det['confidence']:.2f}"
+                    cv2.putText(display_frame, label, (x1, y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Add FPS overlay directly on frame
+                cv2.putText(display_frame, f"FPS: {fps}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # Put frame in queue (non-blocking)
+                try:
+                    # Convert to RGB here in camera thread
+                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    self.frame_queue.put_nowait((frame_rgb, fps, len(current_detections), current_inf_time))
+                except:
+                    pass  # Queue full, skip frame
+                
+                time.sleep(0.033)  # ~30 FPS
+            
+            logger.info("Camera loop ended")
+            
+            if cap:
+                cap.release()
+                logger.info("Camera released")
+            
+            self.app.after(0, lambda: self.widgets['start_camera_btn'].configure(
+                text="📹 Start Camera", fg_color="#1971C2"
+            ))
+        
+        def update_from_queue():
+            """Update GUI from queue - runs in main thread"""
+            if not self.camera_running:
+                return
+            
+            try:
+                # Get frame from queue (non-blocking)
+                frame_rgb, fps, det_count, inf_time = self.frame_queue.get_nowait()
+                
+                # Create PIL Image in main thread
+                img_pil = Image.fromarray(frame_rgb)
+                img_pil.thumbnail((640, 480), Image.Resampling.LANCZOS)
+                
+                # Create CTkImage in main thread
+                ctk_img = CTkImage(light_image=img_pil, dark_image=img_pil, size=img_pil.size)
+                
+                # Update label
+                self.widgets['image_label'].configure(image=ctk_img, text="")
+                self.displayed_image = ctk_img  # Keep reference
+                
+                # Update stats
+                self.widgets['stats_label'].configure(
+                    text=f"FPS: {fps} | Inference: {inf_time:.1f}ms | Detections: {det_count}"
+                )
+                
+            except:
+                pass  # Queue empty
+            
+            # Schedule next update (every 33ms = ~30 FPS)
+            if self.camera_running:
+                self.app.after(33, update_from_queue)
+        
+        # Start camera thread
+        self.camera_thread = threading.Thread(target=camera_loop, daemon=True)
+        self.camera_thread.start()
+        logger.info("Camera thread started")
+        
+        # Start GUI update loop in main thread
+        self.app.after(100, update_from_queue)
     
     def _stop_camera(self):
-        """Stop camera stream"""
-        self.camera_active = False
+        """Stop live camera - IMPROVED cleanup"""
+        logger.info("Stopping camera")
+        self.camera_running = False
         
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        # Clear queue if it exists
+        if hasattr(self, 'frame_queue') and self.frame_queue:
+            try:
+                while not self.frame_queue.empty():
+                    self.frame_queue.get_nowait()
+            except:
+                pass
+        
+        # Wait for thread to finish
+        if self.camera_thread and self.camera_thread.is_alive():
+            self.camera_thread.join(timeout=1.0)
+        
+        # Clear image
+        self.widgets['image_label'].configure(image=None, text="Camera stopped")
+        if self.displayed_image:
+            del self.displayed_image
+            self.displayed_image = None
         
         self.widgets['start_camera_btn'].configure(
             text="📹 Start Camera",
             fg_color="#1971C2"
         )
         
-        logger.info("Camera stopped")
-    
-    def _camera_loop(self):
-        """Main camera loop with detection"""
-        frame_count = 0
-        start_time = time.time()
-        
-        while self.camera_active:
-            try:
-                ret, frame = self.cap.read()
-                if not ret:
-                    logger.warning("Failed to read camera frame")
-                    break
-                
-                # Convert to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Calculate FPS
-                frame_count += 1
-                elapsed = time.time() - start_time
-                fps = frame_count / elapsed if elapsed > 0 else 0
-                
-                # Get current backend
-                backend = self.widgets['backend_var'].get()
-                
-                # Encode frame as JPEG
-                _, buffer = cv2.imencode('.jpg', frame)
-                
-                # Send to API for detection
-                try:
-                    response = requests.post(
-                        f"{API_URL}/detect/visualize",
-                        files={"file": ("frame.jpg", buffer.tobytes(), "image/jpeg")},
-                        params={"backend": backend},
-                        timeout=2
-                    )
-                    
-                    if response.status_code == 200:
-                        from io import BytesIO
-                        img = Image.open(BytesIO(response.content))
-                        img.thumbnail((640, 480), Image.Resampling.LANCZOS)
-                        
-                        # Store reference and update in main thread
-                        self._update_camera_display(img, fps, "Live Camera")
-                    else:
-                        # Show raw frame if detection fails
-                        img = Image.fromarray(frame_rgb)
-                        img.thumbnail((640, 480), Image.Resampling.LANCZOS)
-                        self._update_camera_display(img, fps, "Live (No Detection)")
-                        
-                except requests.RequestException as e:
-                    # Show raw frame if API is down
-                    img = Image.fromarray(frame_rgb)
-                    img.thumbnail((640, 480), Image.Resampling.LANCZOS)
-                    self._update_camera_display(img, fps, "Live (No API)")
-                
-                # Small delay to prevent overload
-                time.sleep(0.03)
-                
-            except Exception as e:
-                logger.error(f"Camera loop error: {e}", exc_info=True)
-                break
-        
-        # Cleanup
-        if self.cap:
-            self.cap.release()
-    
-    def _update_camera_display(self, image, fps, status):
-        """Update camera display in main thread"""
-        # Keep strong reference to image
-        image_copy = image.copy()
-        
-        def do_update():
-            try:
-                self.displayed_image = CTkImage(
-                    light_image=image_copy,
-                    dark_image=image_copy,
-                    size=image_copy.size
-                )
-                self.widgets['image_label'].configure(
-                    image=self.displayed_image,
-                    text=""
-                )
-                self.widgets['stats_label'].configure(
-                    text=f"FPS: {fps:.1f} | {status}"
-                )
-            except Exception as e:
-                logger.error(f"Display update error: {e}")
-        
-        self.app.after(0, do_update)
+        logger.info("Camera stopped successfully")
     
     def cleanup(self):
         """Cleanup when tab is closed"""
-        if self.camera_active:
+        if self.camera_running:
             self._stop_camera()

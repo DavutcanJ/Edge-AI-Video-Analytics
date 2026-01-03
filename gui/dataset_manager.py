@@ -35,14 +35,9 @@ class DatasetValidator:
     def validate(self) -> Tuple[bool, Dict]:
         """
         Validate dataset structure and content.
-        Required structure:
-            dataset_root/
-                train/
-                    images/
-                    labels/
-                val/
-                    images/
-                    labels/
+        Supports two structures:
+        1. dataset_root/train/images, dataset_root/train/labels, etc.
+        2. dataset_root/ directly containing train/ and val/
         
         Returns:
             Tuple of (is_valid, metadata_dict)
@@ -67,11 +62,17 @@ class DatasetValidator:
             self.metadata["errors"] = self.errors
             return False, self.metadata
         
+        # Check if root is a directory
+        if not self.dataset_root.is_dir():
+            self.errors.append(f"Dataset root is not a directory: {self.dataset_root}")
+            self.metadata["errors"] = self.errors
+            return False, self.metadata
+        
         # Check required directory structure
         missing_dirs = []
         for required_path in self.required_structure:
             full_path = self.dataset_root / required_path
-            if not full_path.exists():
+            if not full_path.exists() or not full_path.is_dir():
                 missing_dirs.append(required_path)
         
         if missing_dirs:
@@ -86,8 +87,17 @@ class DatasetValidator:
                 f"      images/\n"
                 f"      labels/\n\n"
                 f"Eksik klasörler: {', '.join(missing_dirs)}\n\n"
-                f"Lütfen veri setinizi bu yapıya göre düzenleyin."
+                f"Mevcut klasörler:\n"
             )
+            
+            # List what actually exists for debugging
+            try:
+                contents = [f.name + ('/' if f.is_dir() else '') for f in self.dataset_root.iterdir()]
+                self.errors[0] += f"  {', '.join(sorted(contents))}\n\n"
+            except:
+                pass
+            
+            self.errors[0] += "Lütfen veri setinizi bu yapıya göre düzenleyin."
             self.metadata["errors"] = self.errors
             return False, self.metadata
         
@@ -317,7 +327,7 @@ class DatasetManager:
         if copy_to_data:
             try:
                 data_dir = self.workspace_root / "data"
-                target_dir = data_dir / name
+                target_dir = data_dir 
                 
                 if target_dir.exists():
                     import shutil
